@@ -1,0 +1,42 @@
+# Dependencies & Package Managers
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# Python & Virtual Environments
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# Environment Variables & Credentials
+.env
+.env.local
+.env.*.local
+
+# Databases & Runtime Data
+agent.db
+backend/agent.db
+backend/uploads/*
+!backend/uploads/.gitkeep
+
+# Build Outputs & Bundles
+dist/
+build/
+*.egg-info/
+
+# IDE & Editor Settings
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db

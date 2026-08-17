@@ -131,7 +131,7 @@ export default function CodePreview({ repoId, filePath, highlightLineRange, onCl
                 borderLeft: highlighted ? '3px solid var(--primary)' : '3px solid transparent'
               }}
             >
-              <span className="code-line-number" style={{color: highlighted ? '#fff' : 'var(--text-muted)'}}>
+              <span className="code-line-number" style={{color: highlighted ? 'var(--text-primary)' : 'var(--text-muted)', fontWeight: highlighted ? 700 : 400}}>
                 {lineNum}
               </span>
               <span className="code-line-content">

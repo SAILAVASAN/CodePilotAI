@@ -99,6 +99,24 @@ function parseMarkdown(text, onSelectCitation) {
       continue;
     }
 
+    // Headers (####, ###, ##, #)
+    if (line.startsWith('#### ')) {
+      renderedElements.push(<h4 key={`h4-${keyIdx++}`}>{renderInlineStyles(line.substring(5))}</h4>);
+      continue;
+    }
+    if (line.startsWith('### ')) {
+      renderedElements.push(<h3 key={`h3-${keyIdx++}`}>{renderInlineStyles(line.substring(4))}</h3>);
+      continue;
+    }
+    if (line.startsWith('## ')) {
+      renderedElements.push(<h2 key={`h2-${keyIdx++}`}>{renderInlineStyles(line.substring(3))}</h2>);
+      continue;
+    }
+    if (line.startsWith('# ')) {
+      renderedElements.push(<h1 key={`h1-${keyIdx++}`}>{renderInlineStyles(line.substring(2))}</h1>);
+      continue;
+    }
+
     // Bullet points
     if (line.startsWith('- ') || line.startsWith('* ')) {
       renderedElements.push(
@@ -360,9 +378,9 @@ export default function AgentChat({ repoId, onSelectCitation }) {
               overflow: 'auto',
               flex: 1,
               fontFamily: 'var(--font-mono)',
-              fontSize: '0.82rem',
-              background: '#040711',
-              color: '#d1d5db',
+              fontSize: '0.85rem',
+              background: 'var(--bg-input)',
+              color: 'var(--text-primary)',
               whiteSpace: 'pre-wrap',
               lineHeight: 1.5
             }}>

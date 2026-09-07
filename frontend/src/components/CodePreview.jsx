@@ -1,4 +1,6 @@
-import React, { useState, useEffect, useRef } from 'react';
+import { useState, useEffect, useRef } from 'react';
+import { X, FileSearch } from 'lucide-react';
+import { apiGet } from '../lib/api';
 
 export default function CodePreview({ repoId, filePath, highlightLineRange, onClose }) {
   const [fileData, setFileData] = useState(null);
@@ -16,7 +18,7 @@ export default function CodePreview({ repoId, filePath, highlightLineRange, onCl
       setLoading(true);
       setError('');
       try {
-        const response = await fetch(`http://localhost:8000/api/repositories/${repoId}/file?path=${encodeURIComponent(filePath)}`);
+        const response = await apiGet(`/api/repositories/${repoId}/file?path=${encodeURIComponent(filePath)}`);
         if (response.ok) {
           const data = await response.json();
           setFileData(data);
@@ -25,7 +27,7 @@ export default function CodePreview({ repoId, filePath, highlightLineRange, onCl
         }
       } catch (err) {
         console.error(err);
-        setError("Error connecting to backend server.");
+        setError('Error connecting to backend server.');
       } finally {
         setLoading(false);
       }
@@ -34,12 +36,10 @@ export default function CodePreview({ repoId, filePath, highlightLineRange, onCl
     fetchFileContent();
   }, [repoId, filePath]);
 
-  // Scroll to highlighted lines if specified
   useEffect(() => {
     if (highlightLineRange && containerRef.current && fileData) {
       const [startLine] = highlightLineRange.split('-').map(Number);
       if (startLine) {
-        // Find line element
         const lineEl = containerRef.current.querySelector(`#line-${startLine}`);
         if (lineEl) {
           lineEl.scrollIntoView({ behavior: 'smooth', block: 'center' });
@@ -49,25 +49,17 @@ export default function CodePreview({ repoId, filePath, highlightLineRange, onCl
   }, [highlightLineRange, fileData]);
 
   if (loading) {
-    return <div style={{padding: '1.5rem', color: 'var(--text-secondary)', fontSize: '0.85rem'}}>Reading codebase file...</div>;
+    return <div className="p-6 text-sm text-text-secondary">Reading codebase file...</div>;
   }
 
   if (error) {
-    return <div style={{padding: '1.5rem', color: 'var(--danger)', fontSize: '0.85rem'}}>{error}</div>;
+    return <div className="p-6 text-sm text-danger">{error}</div>;
   }
 
   if (!fileData) {
     return (
-      <div style={{
-        display: 'flex', 
-        alignItems: 'center', 
-        justifyContent: 'center', 
-        height: '100%', 
-        color: 'var(--text-muted)',
-        fontSize: '0.9rem',
-        textAlign: 'center',
-        padding: '2rem'
-      }}>
+      <div className="flex h-full flex-col items-center justify-center gap-3 p-8 text-center text-sm text-text-muted">
+        <FileSearch size={28} strokeWidth={1.5} className="text-primary" />
         Select a file from the explorer tree or click on an agent codebase citation to inspect code.
       </div>
     );
@@ -75,7 +67,6 @@ export default function CodePreview({ repoId, filePath, highlightLineRange, onCl
 
   const lines = fileData.content.split('\n');
 
-  // Check if a line number is within the highlighted range
   const isLineHighlighted = (lineNum) => {
     if (!highlightLineRange) return false;
     const parts = highlightLineRange.split('-');
@@ -90,53 +81,40 @@ export default function CodePreview({ repoId, filePath, highlightLineRange, onCl
   };
 
   return (
-    <div className="code-preview-container" ref={containerRef}>
-      <div className="code-header" style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-        <div style={{ display: 'flex', alignItems: 'center', gap: '0.75rem' }}>
-          <span className="code-title">{fileData.file_path}</span>
-          <span style={{fontSize: '0.7rem', color: 'var(--text-muted)', textTransform: 'uppercase'}}>{fileData.language}</span>
+    <div className="flex h-full flex-col" ref={containerRef}>
+      <div className="flex items-center justify-between border-b border-border-glass bg-bg-surface px-5 py-3">
+        <div className="flex items-center gap-3">
+          <span className="font-mono text-sm text-accent">{fileData.file_path}</span>
+          <span className="text-[0.7rem] text-text-muted uppercase">{fileData.language}</span>
         </div>
         {onClose && (
-          <button 
+          <button
             onClick={onClose}
-            style={{
-              background: 'transparent',
-              border: 'none',
-              color: 'var(--text-secondary)',
-              cursor: 'pointer',
-              fontSize: '0.95rem',
-              fontWeight: 'bold',
-              padding: '0.2rem 0.5rem',
-              borderRadius: '4px',
-              transition: 'var(--transition-smooth)'
-            }}
-            className="btn-close"
+            className="rounded p-1 text-text-secondary transition-colors hover:text-text-primary"
           >
-            ✕
+            <X size={16} />
           </button>
         )}
       </div>
-      
-      <div className="code-editor">
+
+      <div className="flex-1 overflow-auto whitespace-pre bg-bg-surface-hover p-4 font-mono text-[0.85rem] leading-relaxed text-text-primary">
         {lines.map((line, idx) => {
           const lineNum = idx + 1;
           const highlighted = isLineHighlighted(lineNum);
           return (
-            <div 
-              key={lineNum} 
+            <div
+              key={lineNum}
               id={`line-${lineNum}`}
-              className="code-line"
-              style={{
-                background: highlighted ? 'rgba(99, 102, 241, 0.25)' : 'transparent',
-                borderLeft: highlighted ? '3px solid var(--primary)' : '3px solid transparent'
-              }}
+              className={`flex border-l-[3px] ${highlighted ? 'border-primary bg-indigo-500/25' : 'border-transparent'}`}
             >
-              <span className="code-line-number" style={{color: highlighted ? 'var(--text-primary)' : 'var(--text-muted)', fontWeight: highlighted ? 700 : 400}}>
+              <span
+                className={`w-[45px] shrink-0 border-r border-white/5 pr-5 text-right select-none ${
+                  highlighted ? 'font-bold text-text-primary' : 'text-text-muted'
+                }`}
+              >
                 {lineNum}
               </span>
-              <span className="code-line-content">
-                {line || ' '}
-              </span>
+              <span className="flex-1 pl-5">{line || ' '}</span>
             </div>
           );
         })}

@@ -1,4 +1,10 @@
-import React, { useState, useEffect } from 'react';
+import { useState, useEffect } from 'react';
+import { AnimatePresence, motion } from 'motion/react';
+import { Toaster } from 'sonner';
+import {
+  LayoutDashboard, MessageSquare, Settings, LogOut, Sun, Moon,
+  ChevronLeft, ChevronRight, Bot, KeyRound,
+} from 'lucide-react';
 import './App.css';
 import Dashboard from './components/Dashboard';
 import RepoExplorer from './components/RepoExplorer';
@@ -8,17 +14,33 @@ import APIList from './components/APIList';
 import TestProof from './components/TestProof';
 import ArchDiagram from './components/ArchDiagram';
 import Auth from './components/Auth';
+import RepoPicker from './components/RepoPicker';
+import { apiGet, apiPost } from './lib/api';
+
+const WORKSPACE_TABS = [
+  { key: 'debugging', label: 'Debugging' },
+  { key: 'architecture', label: 'Architecture' },
+  { key: 'apis', label: 'API Discovery' },
+  { key: 'tests', label: 'Test Proof' },
+];
+
+const NAV_ITEMS = [
+  { key: 'dashboard', label: 'Repositories', icon: LayoutDashboard },
+  { key: 'workspace', label: 'Ask Agent', icon: MessageSquare },
+];
 
 export default function App() {
-  const [view, setView] = useState('dashboard'); // 'dashboard', 'workspace', 'settings'
-  const [activeTab, setActiveTab] = useState('debugging'); // 'debugging', 'architecture', 'apis', 'tests'
+  const [view, setView] = useState('dashboard');
+  const [activeTab, setActiveTab] = useState('debugging');
   const [apiKey, setApiKey] = useState('');
   const [selectedRepo, setSelectedRepo] = useState(null);
   const [activeFilePath, setActiveFilePath] = useState(null);
   const [highlightLineRange, setHighlightLineRange] = useState(null);
   const [backendConfigured, setBackendConfigured] = useState(false);
   const [theme, setTheme] = useState(localStorage.getItem('agent_theme') || 'dark');
-  const [user, setUser] = useState(JSON.parse(localStorage.getItem('auth_session')) || null);
+  const [user, setUser] = useState(null);
+  const [authLoading, setAuthLoading] = useState(true);
+  const [repoPickerProvider, setRepoPickerProvider] = useState(null); // null | 'github' | 'gitlab'
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
 
   useEffect(() => {
@@ -31,40 +53,66 @@ export default function App() {
     localStorage.setItem('agent_theme', next);
   };
 
-  // Check backend server status
   const checkStatus = async () => {
     try {
-      const response = await fetch('http://localhost:8000/api/status');
+      const response = await apiGet('/api/status');
       if (response.ok) {
         const data = await response.json();
         setBackendConfigured(data.api_key_configured);
       }
     } catch (e) {
-      console.error("Backend status check failed:", e);
+      console.error('Backend status check failed:', e);
     }
   };
 
+  // On mount: find out who (if anyone) the session cookie identifies as, and
+  // whether we just landed back from an OAuth provider's callback redirect.
   useEffect(() => {
-    // Load local storage api key if any
+    const params = new URLSearchParams(window.location.search);
+    const oauthSuccess = params.get('oauth') === 'success';
+    const oauthProvider = params.get('provider');
+    if (oauthSuccess) {
+      window.history.replaceState({}, '', window.location.pathname);
+    }
+
+    apiGet('/api/auth/me')
+      .then(async (response) => {
+        if (response.ok) {
+          setUser(await response.json());
+          if (oauthSuccess && oauthProvider) {
+            setRepoPickerProvider(oauthProvider);
+          }
+        }
+      })
+      .catch((e) => console.error('Session check failed:', e))
+      .finally(() => setAuthLoading(false));
+  }, []);
+
+  useEffect(() => {
+    if (!user) return;
     const saved = localStorage.getItem('agent_gemini_key') || '';
     setApiKey(saved);
     if (saved) {
-      // Sync with backend session
       updateBackendKey(saved);
     }
     checkStatus();
-  }, []);
+  }, [user]);
+
+  const handleSignOut = async () => {
+    try {
+      await apiPost('/api/auth/logout', {});
+    } catch (e) {
+      console.error('Logout failed:', e);
+    }
+    setUser(null);
+  };
 
   const updateBackendKey = async (key) => {
     try {
-      await fetch('http://localhost:8000/api/settings/apikey', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ api_key: key })
-      });
+      await apiPost('/api/settings/apikey', { api_key: key });
       checkStatus();
     } catch (e) {
-      console.error("Error setting API key on backend:", e);
+      console.error('Error setting API key on backend:', e);
     }
   };
 
@@ -96,293 +144,289 @@ export default function App() {
     }
   };
 
+  if (authLoading) {
+    return <div className="h-screen w-screen bg-bg-base" />;
+  }
+
   if (!user) {
-    return <Auth onLogin={setUser} />;
+    return (
+      <>
+        <Toaster theme={theme} position="top-center" richColors />
+        <Auth onLogin={setUser} />
+      </>
+    );
   }
 
   return (
-    <div className="app-container">
+    <div className="flex h-screen w-screen bg-[image:var(--bg-gradient)]">
+      <Toaster theme={theme} position="top-center" richColors />
+
       {/* Sidebar navigation */}
-      <aside className={`sidebar ${sidebarCollapsed ? 'collapsed' : ''}`}>
-        {/* Floating Minimize / Expand Toggle Button on Edge */}
-        <button 
+      <motion.aside
+        animate={{ width: sidebarCollapsed ? 72 : 260 }}
+        transition={{ duration: 0.25, ease: [0.4, 0, 0.2, 1] }}
+        className="relative z-10 flex flex-shrink-0 flex-col border-r border-border-glass bg-bg-sidebar backdrop-blur-2xl"
+      >
+        <button
           type="button"
-          className="sidebar-toggle-btn"
           onClick={() => setSidebarCollapsed(!sidebarCollapsed)}
-          title={sidebarCollapsed ? "Expand Sidebar" : "Minimize Sidebar"}
+          title={sidebarCollapsed ? 'Expand Sidebar' : 'Minimize Sidebar'}
+          className="absolute top-5 -right-[13px] z-20 flex h-[26px] w-[26px] items-center justify-center rounded-full border border-border-glass bg-bg-surface text-text-primary shadow-lg transition-transform hover:scale-110 hover:border-primary-hover hover:bg-primary hover:text-white"
         >
-          <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
-            {sidebarCollapsed ? (
-              <polyline points="13 17 18 12 13 7" />
-            ) : (
-              <polyline points="11 17 6 12 11 7" />
-            )}
-          </svg>
+          {sidebarCollapsed ? <ChevronRight size={14} strokeWidth={2.5} /> : <ChevronLeft size={14} strokeWidth={2.5} />}
         </button>
 
-        <div className="logo-section">
-          <div style={{ display: 'flex', alignItems: 'center', gap: '0.75rem' }}>
-            <div className="logo-icon">
-              <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><rect x="3" y="11" width="18" height="10" rx="2"/><circle cx="12" cy="5" r="2"/><path d="M12 7v4"/><line x1="8" y1="16" x2="8" y2="16"/><line x1="16" y1="16" x2="16" y2="16"/></svg>
-            </div>
-            {!sidebarCollapsed && (
-              <div style={{ display: 'flex', flexDirection: 'column' }}>
-                <span className="logo-text" style={{ fontFamily: 'var(--font-heading)', fontWeight: 800 }}>CodePilot</span>
-                {user && (
-                  <span className="user-badge-text" style={{ fontSize: '0.7rem', color: 'var(--text-secondary)', marginTop: '0.1rem' }}>
-                    Developer: {user.name || user.email}
-                  </span>
-                )}
-              </div>
-            )}
+        <div className="flex h-full flex-col overflow-hidden">
+        <div className="flex items-center gap-3 border-b border-border-glass px-5 py-6">
+          <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-gradient-to-br from-primary to-accent text-white shadow-[0_0_15px_var(--primary-glow)]">
+            <Bot size={20} />
           </div>
+          {!sidebarCollapsed && (
+            <div className="flex min-w-0 flex-col">
+              <span className="truncate font-heading text-base font-extrabold bg-[image:var(--logo-text-gradient)] bg-clip-text text-transparent">
+                CodePilot
+              </span>
+              <span className="truncate text-[0.7rem] text-text-secondary">
+                Developer: {user.name || user.email}
+              </span>
+            </div>
+          )}
         </div>
 
-        <ul className="nav-links">
-          <li 
-            className={`nav-item ${view === 'dashboard' ? 'active' : ''}`}
-            onClick={() => setView('dashboard')}
-          >
-            <svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><rect x="3" y="3" width="7" height="9" rx="1"/><rect x="14" y="3" width="7" height="5" rx="1"/><rect x="14" y="12" width="7" height="9" rx="1"/><rect x="3" y="16" width="7" height="5" rx="1"/></svg>
-            <span>Repositories</span>
-          </li>
-          <li 
-            className={`nav-item ${view === 'workspace' ? 'active' : ''} ${!selectedRepo ? 'disabled-nav' : ''}`}
-            onClick={() => selectedRepo && setView('workspace')}
-            style={{ opacity: selectedRepo ? 1 : 0.5, cursor: selectedRepo ? 'pointer' : 'not-allowed' }}
-          >
-            <svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>
-            <span>Ask Agent</span>
-          </li>
-          <li 
-            className={`nav-item ${view === 'settings' ? 'active' : ''}`}
+        <ul className="flex flex-1 flex-col gap-1 px-3 py-5">
+          {NAV_ITEMS.map(({ key, label, icon: Icon }) => {
+            const disabled = key === 'workspace' && !selectedRepo;
+            const active = view === key;
+            return (
+              <li
+                key={key}
+                onClick={() => !disabled && setView(key)}
+                className={`flex items-center gap-3 rounded-lg px-4 py-3 text-sm font-medium transition-colors ${
+                  disabled ? 'cursor-not-allowed opacity-50' : 'cursor-pointer'
+                } ${
+                  active
+                    ? 'border-l-[3px] border-primary bg-gradient-to-r from-indigo-500/15 to-cyan-500/5 text-text-primary'
+                    : 'text-text-secondary hover:bg-bg-surface-hover hover:text-text-primary'
+                }`}
+              >
+                <Icon size={18} />
+                {!sidebarCollapsed && <span>{label}</span>}
+              </li>
+            );
+          })}
+
+          <li
             onClick={() => setView('settings')}
-            style={{ marginTop: 'auto' }}
+            className={`mt-auto flex cursor-pointer items-center gap-3 rounded-lg px-4 py-3 text-sm font-medium transition-colors ${
+              view === 'settings'
+                ? 'border-l-[3px] border-primary bg-gradient-to-r from-indigo-500/15 to-cyan-500/5 text-text-primary'
+                : 'text-text-secondary hover:bg-bg-surface-hover hover:text-text-primary'
+            }`}
           >
-            <svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
-            <span>Settings</span>
+            <Settings size={18} />
+            {!sidebarCollapsed && <span>Settings</span>}
           </li>
-          <li 
-            className="nav-item"
-            onClick={() => {
-              localStorage.removeItem('auth_session');
-              setUser(null);
-            }}
-            style={{ cursor: 'pointer', borderTop: '1px solid var(--border-glass)', borderRadius: 0, paddingTop: '1rem', marginTop: '0.5rem' }}
+          <li
+            onClick={handleSignOut}
+            className="mt-1 flex cursor-pointer items-center gap-3 rounded-none border-t border-border-glass px-4 pt-4 pb-1 text-sm font-medium text-text-secondary transition-colors hover:text-text-primary"
           >
-            <svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><polyline points="16 17 21 12 16 7"/><line x1="21" y1="12" x2="9" y2="12"/></svg>
-            <span>Sign Out</span>
+            <LogOut size={18} />
+            {!sidebarCollapsed && <span>Sign Out</span>}
           </li>
         </ul>
-      </aside>
+        </div>
+      </motion.aside>
 
       {/* Main content display */}
-      <main className="main-content">
-        <header className="app-header">
-          <div className="header-title">
-            <h1>{getHeaderTitle()}</h1>
-          </div>
+      <main className="relative flex h-screen flex-1 flex-col overflow-hidden">
+        <header className="z-[5] flex h-16 items-center justify-between border-b border-border-glass bg-bg-header px-6 backdrop-blur-2xl">
+          <h1 className="text-lg font-semibold text-text-primary">{getHeaderTitle()}</h1>
 
-          <div className="header-actions">
-            <button className="theme-toggle-btn" onClick={toggleTheme} style={{
-              background: 'transparent',
-              border: '1px solid var(--border-glass)',
-              color: 'var(--text-primary)',
-              padding: '0.4rem 0.8rem',
-              borderRadius: '6px',
-              cursor: 'pointer',
-              fontSize: '0.8rem',
-              fontWeight: 500,
-              display: 'flex',
-              alignItems: 'center',
-              gap: '0.4rem'
-            }}>
-              {theme === 'dark' ? (
-                <>
-                  <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><circle cx="12" cy="12" r="5"/><line x1="12" y1="1" x2="12" y2="3"/><line x1="12" y1="21" x2="12" y2="23"/><line x1="4.22" y1="4.22" x2="5.64" y2="5.64"/><line x1="18.36" y1="18.36" x2="19.78" y2="19.78"/><line x1="1" y1="12" x2="3" y2="12"/><line x1="21" y1="12" x2="23" y2="12"/><line x1="4.22" y1="19.78" x2="5.64" y2="18.36"/><line x1="18.36" y1="5.64" x2="19.78" y2="4.22"/></svg>
-                  <span>Light Mode</span>
-                </>
-              ) : (
-                <>
-                  <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg>
-                  <span>Dark Mode</span>
-                </>
-              )}
+          <div className="flex items-center gap-4">
+            <button
+              onClick={toggleTheme}
+              className="flex items-center gap-1.5 rounded-md border border-border-glass px-3 py-1.5 text-xs font-medium text-text-primary transition-colors hover:bg-bg-surface-hover"
+            >
+              {theme === 'dark' ? <><Sun size={14} /><span>Light Mode</span></> : <><Moon size={14} /><span>Dark Mode</span></>}
             </button>
-            
+
             {backendConfigured ? (
-              <div className="api-badge configured" title="API connection active.">
+              <div className="flex items-center gap-2 rounded-full border border-emerald-500/20 bg-emerald-500/10 px-3 py-1.5 text-sm font-medium text-success">
                 ● Connected
               </div>
             ) : (
-              <div className="api-badge missing" onClick={() => setView('settings')} title="Click to set your API Key.">
+              <div
+                onClick={() => setView('settings')}
+                className="flex cursor-pointer items-center gap-2 rounded-full border border-red-500/20 bg-red-500/10 px-3 py-1.5 text-sm font-medium text-danger animate-pulse"
+                title="Click to set your API Key."
+              >
                 ● Key Required
               </div>
             )}
           </div>
         </header>
 
-        {/* View Switch */}
-        {view === 'dashboard' && (
-          <Dashboard 
-            onSelectRepo={handleSelectRepo} 
-            selectedRepoId={selectedRepo?.id}
-          />
-        )}
+        <AnimatePresence mode="wait">
+          {view === 'dashboard' && (
+            <motion.div
+              key="dashboard"
+              initial={{ opacity: 0, y: 6 }}
+              animate={{ opacity: 1, y: 0 }}
+              exit={{ opacity: 0, y: -6 }}
+              transition={{ duration: 0.18 }}
+              className="flex flex-1 flex-col overflow-hidden"
+            >
+              <Dashboard
+                onSelectRepo={handleSelectRepo}
+                selectedRepoId={selectedRepo?.id}
+                onImportFromProvider={setRepoPickerProvider}
+              />
+            </motion.div>
+          )}
 
-        {view === 'workspace' && selectedRepo && (
-          <div style={{ display: 'flex', flexDirection: 'column', flex: 1, height: 'calc(100vh - 64px)' }}>
-            {/* Workspace Subheader with Tabs */}
-            <div style={{
-              height: '48px',
-              borderBottom: '1px solid var(--border-glass)',
-              background: 'var(--bg-surface)',
-              display: 'flex',
-              alignItems: 'center',
-              padding: '0 1.5rem',
-              justifyContent: 'space-between'
-            }}>
-              <div style={{ display: 'flex', gap: '1.5rem', height: '100%' }}>
-                {['debugging', 'architecture', 'apis', 'tests'].map(tab => (
-                  <button 
-                    key={tab}
-                    onClick={() => setActiveTab(tab)}
-                    style={{
-                      background: 'transparent',
-                      border: 'none',
-                      color: activeTab === tab ? 'var(--text-primary)' : 'var(--text-secondary)',
-                      fontSize: '0.85rem',
-                      fontWeight: 600,
-                      cursor: 'pointer',
-                      height: '100%',
-                      padding: '0 0.25rem',
-                      borderBottom: activeTab === tab ? '2px solid var(--primary)' : '2px solid transparent',
-                      transition: 'var(--transition-smooth)',
-                      textTransform: 'uppercase',
-                      letterSpacing: '0.5px'
-                    }}
-                  >
-                    {tab === 'debugging' ? 'Debugging' : tab === 'architecture' ? 'Architecture' : tab === 'apis' ? 'API Discovery' : 'Test Proof'}
-                  </button>
-                ))}
-              </div>
-              <div style={{ fontSize: '0.75rem', color: 'var(--text-muted)', fontFamily: 'var(--font-mono)' }}>
-                main • indexed just now
-              </div>
-            </div>
-            
-            {/* Workspace Panels based on Tab */}
-            <div style={{ display: 'flex', flex: 1, overflow: 'hidden' }}>
-              {activeTab === 'debugging' && (
-                <>
-                  <div style={{ width: activeFilePath ? '50%' : '100%', height: '100%', borderRight: activeFilePath ? '1px solid var(--border-glass)' : 'none' }}>
-                    <AgentChat 
-                      repoId={selectedRepo.id} 
-                      onSelectCitation={handleCitationClick}
-                    />
-                  </div>
-                  {activeFilePath && (
-                    <div style={{ width: '50%', height: '100%' }}>
-                      <CodePreview 
-                        repoId={selectedRepo.id}
-                        filePath={activeFilePath}
-                        highlightLineRange={highlightLineRange}
-                        onClose={() => setActiveFilePath(null)}
-                      />
-                    </div>
-                  )}
-                </>
-              )}
-
-              {activeTab === 'architecture' && (
-                <>
-                  <div style={{ width: activeFilePath ? '22%' : '30%', height: '100%', borderRight: '1px solid var(--border-glass)' }}>
-                    <RepoExplorer 
-                      repoId={selectedRepo.id}
-                      activeFilePath={activeFilePath}
-                      onSelectFile={(path) => {
-                        setActiveFilePath(path);
-                        setHighlightLineRange(null);
-                      }}
-                    />
-                  </div>
-                  <div style={{ width: activeFilePath ? '38%' : '70%', height: '100%', borderRight: activeFilePath ? '1px solid var(--border-glass)' : 'none' }}>
-                    <ArchDiagram 
-                      onSelectFile={(file, line) => {
-                        setActiveFilePath(file);
-                        setHighlightLineRange(line);
-                      }}
-                    />
-                  </div>
-                  {activeFilePath && (
-                    <div style={{ width: '40%', height: '100%' }}>
-                      <CodePreview 
-                        repoId={selectedRepo.id}
-                        filePath={activeFilePath}
-                        highlightLineRange={highlightLineRange}
-                        onClose={() => setActiveFilePath(null)}
-                      />
-                    </div>
-                  )}
-                </>
-              )}
-
-              {activeTab === 'apis' && (
-                <>
-                  <div style={{ width: activeFilePath ? '50%' : '100%', height: '100%', borderRight: activeFilePath ? '1px solid var(--border-glass)' : 'none' }}>
-                    <APIList 
-                      repoId={selectedRepo.id}
-                      onSelectFile={(file, line) => {
-                        setActiveFilePath(file);
-                        setHighlightLineRange(line);
-                      }}
-                    />
-                  </div>
-                  {activeFilePath && (
-                    <div style={{ width: '50%', height: '100%' }}>
-                      <CodePreview 
-                        repoId={selectedRepo.id}
-                        filePath={activeFilePath}
-                        highlightLineRange={highlightLineRange}
-                        onClose={() => setActiveFilePath(null)}
-                      />
-                    </div>
-                  )}
-                </>
-              )}
-
-              {activeTab === 'tests' && (
-                <div style={{ width: '100%', height: '100%' }}>
-                  <TestProof repoId={selectedRepo.id} />
+          {view === 'workspace' && selectedRepo && (
+            <motion.div
+              key="workspace"
+              initial={{ opacity: 0, y: 6 }}
+              animate={{ opacity: 1, y: 0 }}
+              exit={{ opacity: 0, y: -6 }}
+              transition={{ duration: 0.18 }}
+              className="flex flex-1 flex-col overflow-hidden"
+            >
+              <div className="flex h-12 shrink-0 items-center justify-between border-b border-border-glass bg-bg-surface px-6">
+                <div className="flex h-full gap-6">
+                  {WORKSPACE_TABS.map(({ key, label }) => (
+                    <button
+                      key={key}
+                      onClick={() => setActiveTab(key)}
+                      className={`h-full border-b-2 px-1 text-sm font-semibold tracking-wide uppercase transition-colors ${
+                        activeTab === key
+                          ? 'border-primary text-text-primary'
+                          : 'border-transparent text-text-secondary hover:text-text-primary'
+                      }`}
+                    >
+                      {label}
+                    </button>
+                  ))}
                 </div>
-              )}
-            </div>
-          </div>
-        )}
+                <div className="font-mono text-xs text-text-muted">main • indexed just now</div>
+              </div>
 
-        {view === 'settings' && (
-          <div style={{ padding: '2rem', display: 'flex', flexDirection: 'column', gap: '1.5rem', maxWidth: '600px' }}>
-            <div className="dashboard-card">
-              <h2 className="card-title" style={{marginBottom: '1rem'}}>Gemini API Key</h2>
-              <p style={{fontSize: '0.85rem', color: 'var(--text-secondary)', marginBottom: '1.25rem'}}>
-                Enter your Google Gemini API Key below. This key will be used to generate text embeddings (`gemini-embedding-2`) and process developer Q&A using the `gemini-3.5-flash` model.
-              </p>
-              <div className="form-group">
-                <input 
-                  type="password" 
-                  className="form-input" 
-                  placeholder="AIzaSy..."
-                  value={apiKey} 
-                  onChange={handleApiKeyChange}
-                />
+              <div className="flex flex-1 overflow-hidden">
+                {activeTab === 'debugging' && (
+                  <>
+                    <div className={`h-full ${activeFilePath ? 'w-1/2 border-r border-border-glass' : 'w-full'}`}>
+                      <AgentChat repoId={selectedRepo.id} onSelectCitation={handleCitationClick} />
+                    </div>
+                    {activeFilePath && (
+                      <div className="h-full w-1/2">
+                        <CodePreview
+                          repoId={selectedRepo.id}
+                          filePath={activeFilePath}
+                          highlightLineRange={highlightLineRange}
+                          onClose={() => setActiveFilePath(null)}
+                        />
+                      </div>
+                    )}
+                  </>
+                )}
+
+                {activeTab === 'architecture' && (
+                  <>
+                    <div className={`h-full border-r border-border-glass ${activeFilePath ? 'w-[22%]' : 'w-[30%]'}`}>
+                      <RepoExplorer
+                        repoId={selectedRepo.id}
+                        activeFilePath={activeFilePath}
+                        onSelectFile={(path) => { setActiveFilePath(path); setHighlightLineRange(null); }}
+                      />
+                    </div>
+                    <div className={`h-full ${activeFilePath ? 'w-[38%] border-r border-border-glass' : 'w-[70%]'}`}>
+                      <ArchDiagram onSelectFile={(file, line) => { setActiveFilePath(file); setHighlightLineRange(line); }} />
+                    </div>
+                    {activeFilePath && (
+                      <div className="h-full w-2/5">
+                        <CodePreview
+                          repoId={selectedRepo.id}
+                          filePath={activeFilePath}
+                          highlightLineRange={highlightLineRange}
+                          onClose={() => setActiveFilePath(null)}
+                        />
+                      </div>
+                    )}
+                  </>
+                )}
+
+                {activeTab === 'apis' && (
+                  <>
+                    <div className={`h-full ${activeFilePath ? 'w-1/2 border-r border-border-glass' : 'w-full'}`}>
+                      <APIList
+                        repoId={selectedRepo.id}
+                        onSelectFile={(file, line) => { setActiveFilePath(file); setHighlightLineRange(line); }}
+                      />
+                    </div>
+                    {activeFilePath && (
+                      <div className="h-full w-1/2">
+                        <CodePreview
+                          repoId={selectedRepo.id}
+                          filePath={activeFilePath}
+                          highlightLineRange={highlightLineRange}
+                          onClose={() => setActiveFilePath(null)}
+                        />
+                      </div>
+                    )}
+                  </>
+                )}
+
+                {activeTab === 'tests' && (
+                  <div className="h-full w-full">
+                    <TestProof repoId={selectedRepo.id} />
+                  </div>
+                )}
               </div>
-              <div style={{marginTop: '1rem', color: 'var(--text-muted)', fontSize: '0.75rem'}}>
-                Keys are saved in your browser local storage and set in active backend sessions.
+            </motion.div>
+          )}
+
+          {view === 'settings' && (
+            <motion.div
+              key="settings"
+              initial={{ opacity: 0, y: 6 }}
+              animate={{ opacity: 1, y: 0 }}
+              exit={{ opacity: 0, y: -6 }}
+              transition={{ duration: 0.18 }}
+              className="flex flex-1 flex-col gap-6 overflow-y-auto p-8"
+            >
+              <div className="max-w-xl rounded-2xl border border-border-glass bg-bg-surface p-6 shadow-card backdrop-blur-2xl">
+                <h2 className="mb-4 flex items-center gap-2 font-heading text-lg font-semibold text-text-primary">
+                  <KeyRound size={18} className="text-primary" />
+                  Gemini API Key
+                </h2>
+                <p className="mb-5 text-sm text-text-secondary">
+                  Enter your Google Gemini API Key below. This key will be used to generate text embeddings (`gemini-embedding-2`) and process developer Q&A using the `gemini-3.5-flash` model.
+                </p>
+                <div className="flex flex-col gap-1.5">
+                  <input
+                    type="password"
+                    placeholder="AIzaSy..."
+                    value={apiKey}
+                    onChange={handleApiKeyChange}
+                    className="rounded-lg border border-border-glass bg-bg-input px-4 py-3 text-sm text-text-primary outline-none transition-shadow focus:border-primary focus:shadow-[0_0_0_3px_var(--primary-glow)]"
+                  />
+                </div>
+                <div className="mt-4 text-xs text-text-muted">
+                  Keys are saved in your browser local storage and set in active backend sessions.
+                </div>
               </div>
-            </div>
-          </div>
-        )}
+            </motion.div>
+          )}
+        </AnimatePresence>
       </main>
+
+      <RepoPicker
+        open={!!repoPickerProvider}
+        provider={repoPickerProvider}
+        onClose={() => setRepoPickerProvider(null)}
+        onImported={() => setRepoPickerProvider(null)}
+      />
     </div>
   );
 }

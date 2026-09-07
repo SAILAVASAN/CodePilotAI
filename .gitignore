@@ -25,6 +25,7 @@ venv.bak/
 # Databases & Runtime Data
 agent.db
 backend/agent.db
+backend/*.db.bak-*
 backend/uploads/*
 !backend/uploads/.gitkeep
 

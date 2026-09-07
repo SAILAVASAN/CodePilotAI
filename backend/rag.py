@@ -1,6 +1,7 @@
 import re
 import os
 import ast
+import time
 import subprocess
 import httpx
 import numpy as np
@@ -48,33 +49,75 @@ EXTENSION_LANGUAGES = {
     '.ps1': 'powershell'
 }
 
+EMBEDDING_MODELS = ["text-embedding-004", "gemini-embedding-2"]
+
+
+def resolve_embedding_key(api_key: str) -> str:
+    """Embeddings always go through Gemini, even when the resolved chat key is a
+    Moonshot/Kimi key ("sk-..." prefix) — the two providers aren't interchangeable,
+    so swap to the backend's own Gemini key for embedding calls in that case."""
+    if api_key.startswith("sk-"):
+        return os.environ.get("GEMINI_API_KEY") or api_key
+    return api_key
+
+
 class GeminiClient:
-    def __init__(self, api_key: str):
+    def __init__(self, api_key: str, max_concurrency: int = 8):
         self.api_key = api_key
-        self.client = httpx.Client(timeout=60.0)
-        
-    def embed_text(self, text: str) -> list[float]:
-        """Generate text embedding vector using text-embedding-004 or gemini-embedding-2."""
-        # Try text-embedding-004 first, fallback to gemini-embedding-2
-        for model in ["text-embedding-004", "gemini-embedding-2"]:
-            url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:embedContent?key={self.api_key}"
-            headers = {"Content-Type": "application/json"}
-            payload = {
-                "content": {
-                    "parts": [{"text": text}]
-                }
-            }
+        # A generous connection pool so the ingestion thread pool can actually
+        # run `max_concurrency` embedding requests at once instead of queueing
+        # behind httpx's default pool size.
+        self.client = httpx.Client(
+            timeout=60.0,
+            limits=httpx.Limits(max_connections=max_concurrency * 2, max_keepalive_connections=max_concurrency),
+        )
+
+    def _post_embed(self, model: str, text: str):
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:embedContent?key={self.api_key}"
+        return self.client.post(
+            url,
+            json={"content": {"parts": [{"text": text}]}},
+            headers={"Content-Type": "application/json"},
+        )
+
+    def resolve_working_model(self) -> str:
+        """Finds which embedding model this API key can actually use. Call this
+        once, synchronously, before embedding chunks concurrently — probing per
+        chunk from multiple threads would race on which model "won"."""
+        for model in EMBEDDING_MODELS:
             try:
-                response = self.client.post(url, json=payload, headers=headers)
+                response = self._post_embed(model, "ping")
                 if response.status_code == 200:
-                    data = response.json()
-                    return data["embedding"]["values"]
-                else:
-                    logger.warning(f"Model {model} embedding failed: {response.text}")
+                    return model
+                logger.warning(f"Model {model} embedding failed: {response.text}")
             except Exception as e:
                 logger.error(f"Error calling embedding with {model}: {e}")
-                
+
         raise Exception("All Gemini embedding models failed. Please verify API key and network connectivity.")
+
+    def embed_text(self, text: str, model: str = EMBEDDING_MODELS[0], retries: int = 4) -> list[float]:
+        """Generate a text embedding vector using the given (already-resolved) model.
+        Retries with exponential backoff on 429/5xx — those are typically transient
+        rate-limit/server hiccups, not permanent failures, so an immediate retry
+        (or none at all) would just fail again for no reason."""
+        last_error = None
+        for attempt in range(retries + 1):
+            try:
+                response = self._post_embed(model, text)
+                if response.status_code == 200:
+                    return response.json()["embedding"]["values"]
+                last_error = response.text
+                if response.status_code == 429 or response.status_code >= 500:
+                    if attempt < retries:
+                        time.sleep(min(2 ** attempt, 20))
+                        continue
+                break  # non-retryable (e.g. 400 bad request) — no point retrying
+            except Exception as e:
+                last_error = str(e)
+                if attempt < retries:
+                    time.sleep(min(2 ** attempt, 20))
+
+        raise Exception(f"Embedding with model {model} failed after {attempt + 1} attempt(s): {last_error}")
 
 def clone_repository(repo_url: str, dest_dir: str, git_path: str = "git") -> str:
     """Clones a git repository using the specified git binary to dest_dir."""

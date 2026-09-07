@@ -2,23 +2,11 @@ import os
 import shutil
 import traceback
 import logging
-from fastapi import FastAPI, BackgroundTasks, HTTPException, Query, Header
-from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
-from typing import Optional, List
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
-import db
-import rag
-from agent import SoftwareAgent
-
-# Set up logging
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s"
-)
-logger = logging.getLogger(__name__)
-
-# Load .env file manually
+# Load .env file manually BEFORE importing auth/oauth below — both read their
+# JWT/OAuth config from os.environ at module import time, so the environment
+# has to be populated first or they'll always see empty values.
 backend_dir = os.path.dirname(os.path.abspath(__file__))
 env_path = os.path.join(backend_dir, ".env")
 if os.path.exists(env_path):
@@ -29,31 +17,58 @@ if os.path.exists(env_path):
                 key, val = line.split("=", 1)
                 os.environ[key.strip()] = val.strip()
 
+from fastapi import FastAPI, BackgroundTasks, HTTPException, Query, Depends, Response
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+from typing import Optional
+
+import auth
+import db
+import oauth
+import rag
+from agent import SoftwareAgent
+
+# Set up logging
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s"
+)
+logger = logging.getLogger(__name__)
+
 app = FastAPI(title="DevCopilot API")
 
-# Enable CORS for frontend
+FRONTEND_ORIGIN = os.environ.get("FRONTEND_ORIGIN", "http://localhost:5173")
+
+# Enable CORS for the frontend only. allow_credentials=True requires a concrete
+# origin (browsers reject the wildcard+credentials combo), which is also what
+# lets the httpOnly session cookie actually be sent/received cross-port.
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=[FRONTEND_ORIGIN],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# In-memory session key fallback if not in env
-LOCAL_API_KEY = os.environ.get("MOONSHOT_API_KEY") or os.environ.get("GEMINI_API_KEY", "")
+app.include_router(oauth.router)
 
-def get_api_key(authorization: Optional[str] = Header(None)) -> str:
-    """Gets the Gemini API key from environment, backend config, or authorization header."""
-    global LOCAL_API_KEY
-    if LOCAL_API_KEY:
-        return LOCAL_API_KEY
-    
-    if authorization and authorization.startswith("Bearer "):
-        key = authorization.split(" ")[1].strip()
-        if key:
-            return key
-            
+# How many chunks to embed at once during ingestion. Higher = faster ingestion
+# but more concurrent requests against the Gemini API's rate limit — lower this
+# if ingestion starts hitting 429s on a lower API tier.
+EMBEDDING_CONCURRENCY = int(os.environ.get("EMBEDDING_CONCURRENCY", "8"))
+
+
+def get_api_key(current_user: dict) -> str:
+    """Resolves the Gemini/Moonshot key: the signed-in user's own saved key first,
+    falling back to a backend-operator-wide key from the environment."""
+    user_key = db.get_api_key_for_user(current_user["id"])
+    if user_key:
+        return user_key
+
+    env_key = os.environ.get("MOONSHOT_API_KEY") or os.environ.get("GEMINI_API_KEY", "")
+    if env_key:
+        return env_key
+
     raise HTTPException(
         status_code=401,
         detail="Gemini API Key required. Please configure it in Settings."
@@ -63,87 +78,97 @@ def get_api_key(authorization: Optional[str] = Header(None)) -> str:
 class RepoConnectRequest(BaseModel):
     name: str
     url: Optional[str] = None
-    local_path: Optional[str] = None # Support local directory scan!
+    local_path: Optional[str] = None  # Support local directory scan!
+    provider: Optional[str] = None    # 'github' | 'gitlab' when imported via the repo picker
 
 class ChatRequest(BaseModel):
     repo_id: int
     message: str
 
 # Ingestion Worker
-def ingest_repository_task(repo_id: int, api_key: str):
-    """Clones (if git URL) and ingests repository files and code chunks."""
+def ingest_repository_task(repo_id: int, api_key: str, clone_url_override: Optional[str] = None):
+    """Clones (if git URL) and ingests repository files and code chunks.
+    clone_url_override carries a token-authenticated clone URL for private OAuth
+    imports; it is never persisted to the database."""
     conn = db.get_db_connection()
     cursor = conn.cursor()
     cursor.execute("SELECT url, local_path FROM repositories WHERE id = ?", (repo_id,))
     row = cursor.fetchone()
     conn.close()
-    
+
     if not row:
         logger.error(f"Ingestion failed: Repository {repo_id} not found.")
         return
-        
+
     repo_url = row["url"]
     local_path = row["local_path"]
     git_path = os.environ.get("GIT_PATH", "git")
-    
+
     try:
         if repo_url:
             db.update_repo_status(repo_id, "cloning")
             uploads_dir = os.path.join(backend_dir, "uploads")
-            cloned_path = rag.clone_repository(repo_url, uploads_dir, git_path)
+            cloned_path = rag.clone_repository(clone_url_override or repo_url, uploads_dir, git_path)
             local_path = cloned_path
-            
+
             conn = db.get_db_connection()
             cursor = conn.cursor()
             cursor.execute("UPDATE repositories SET local_path = ? WHERE id = ?", (cloned_path, repo_id))
             conn.commit()
             conn.close()
-            
+
         db.update_repo_status(repo_id, "ingesting")
         logger.info(f"Scanning files in path: {local_path}")
         files = rag.scan_files(local_path)
         logger.info(f"Scanned {len(files)} files in repository {repo_id}")
-        
-        # Initialize Gemini embedder client
-        rag_client = rag.GeminiClient(api_key)
-        
-        # Save files and create chunks
-        for idx, f in enumerate(files):
-            file_path = f["file_path"]
-            logger.info(f"Ingesting file ({idx+1}/{len(files)}): {file_path}")
-            
-            file_id = db.save_file(
-                repo_id=repo_id,
-                file_path=file_path,
-                language=f["language"],
-                content=f["content"],
-                size_bytes=f["size_bytes"]
-            )
-            
-            # Chunk file
-            chunks = rag.chunk_file(file_path, f["content"], f["language"])
-            logger.info(f"Generated {len(chunks)} chunks for {file_path}")
-            
-            # Generate embeddings and save chunks
-            for chunk in chunks:
-                try:
-                    emb = rag_client.embed_text(chunk["text"])
-                    db.save_chunk(
-                        repo_id=repo_id,
-                        file_path=file_path,
-                        start_line=chunk["start_line"],
-                        end_line=chunk["end_line"],
-                        chunk_type=chunk["type"],
-                        name=chunk["name"],
-                        text=chunk["text"],
-                        embedding_vector=emb
-                    )
-                except Exception as chunk_err:
-                    logger.error(f"Error embedding chunk of {file_path}: {chunk_err}")
-                    
+
+        # Chunk every file up front (cheap, CPU-only) and save all file rows in
+        # one batch, then embed every chunk concurrently — embedding is the
+        # actual bottleneck (one network round-trip per chunk), so this is
+        # where parallelism matters.
+        db.save_files_batch(repo_id, files)
+
+        all_chunks = []
+        for f in files:
+            chunks = rag.chunk_file(f["file_path"], f["content"], f["language"])
+            all_chunks.extend(chunks)
+        logger.info(f"Generated {len(all_chunks)} chunks across {len(files)} files in repository {repo_id}")
+
+        rag_client = rag.GeminiClient(rag.resolve_embedding_key(api_key), max_concurrency=EMBEDDING_CONCURRENCY)
+
+        embedded_chunks = []
+        total = len(all_chunks)
+        if total > 0:
+            # Resolve which embedding model this key can use ONCE, synchronously,
+            # before firing off concurrent requests — probing per chunk from
+            # multiple worker threads at once races on which model "won".
+            embedding_model = rag_client.resolve_working_model()
+            logger.info(f"Using embedding model '{embedding_model}' for repository {repo_id}")
+
+            def embed_chunk(chunk):
+                return {**chunk, "embedding": rag_client.embed_text(chunk["text"], model=embedding_model)}
+
+            with ThreadPoolExecutor(max_workers=EMBEDDING_CONCURRENCY) as executor:
+                futures = {executor.submit(embed_chunk, chunk): chunk for chunk in all_chunks}
+                for done, future in enumerate(as_completed(futures), start=1):
+                    chunk = futures[future]
+                    try:
+                        embedded_chunks.append(future.result())
+                    except Exception as chunk_err:
+                        logger.error(f"Error embedding chunk of {chunk['file_path']}: {chunk_err}")
+                    if done % 25 == 0 or done == total:
+                        logger.info(f"Embedded {done}/{total} chunks for repository {repo_id}")
+
+        if total > 0 and not embedded_chunks:
+            raise Exception(f"All {total} chunks failed to embed — check your API key and quota.")
+        if len(embedded_chunks) < total:
+            logger.warning(f"{total - len(embedded_chunks)}/{total} chunks failed to embed for repository {repo_id}; proceeding with a partial index.")
+
+        db.save_chunks_batch(repo_id, embedded_chunks)
+
         db.update_repo_status(repo_id, "ready")
         logger.info(f"Repository {repo_id} successfully ingested and ready.")
-        
+
     except Exception as e:
         error_msg = f"Ingestion Error: {str(e)}\n{traceback.format_exc()}"
         logger.error(error_msg)
@@ -154,131 +179,123 @@ def startup_event():
     db.init_db()
 
 @app.get("/api/status")
-def get_status():
-    global LOCAL_API_KEY
+def get_status(current_user: dict = Depends(auth.get_current_user)):
+    key = db.get_api_key_for_user(current_user["id"]) or os.environ.get("MOONSHOT_API_KEY") or os.environ.get("GEMINI_API_KEY", "")
     return {
-        "api_key_configured": bool(LOCAL_API_KEY)
+        "api_key_configured": bool(key)
     }
 
 @app.post("/api/settings/apikey")
-def save_api_key(payload: dict):
-    global LOCAL_API_KEY
+def save_api_key(payload: dict, current_user: dict = Depends(auth.get_current_user)):
     key = payload.get("api_key", "").strip()
     if not key:
         raise HTTPException(status_code=400, detail="API key is empty")
-    LOCAL_API_KEY = key
+    db.set_api_key_for_user(current_user["id"], key)
     return {"success": True, "message": "API key updated."}
 
 @app.get("/api/repositories")
-def list_repositories():
-    conn = db.get_db_connection()
-    cursor = conn.cursor()
-    cursor.execute("SELECT id, name, url, local_path, status, error_message, created_at FROM repositories")
-    repos = [dict(r) for r in cursor.fetchall()]
-    conn.close()
-    return repos
+def list_repositories(current_user: dict = Depends(auth.get_current_user)):
+    return db.list_repositories_for_user(current_user["id"])
 
 @app.post("/api/repositories")
-def connect_repository(req: RepoConnectRequest, background_tasks: BackgroundTasks, authorization: Optional[str] = Header(None)):
-    api_key = get_api_key(authorization)
-    
+def connect_repository(req: RepoConnectRequest, background_tasks: BackgroundTasks, current_user: dict = Depends(auth.get_current_user)):
+    api_key = get_api_key(current_user)
+
     # Validation
     if not req.url and not req.local_path:
         raise HTTPException(status_code=400, detail="Either Git URL or Local Folder Path must be provided.")
-        
+
     local_path = req.local_path or ""
     if local_path and not os.path.exists(local_path):
         raise HTTPException(status_code=400, detail=f"Local path does not exist: {local_path}")
-        
+
     # Save repo placeholder
     repo_id = db.save_repository(
         name=req.name,
         url=req.url,
         local_path=local_path,
+        user_id=current_user["id"],
         status="pending"
     )
-    
+
+    # For OAuth-imported repos, resolve a token-authenticated clone URL server-side
+    # now (while we still have the request context) — the raw token never reaches
+    # the browser and is never written to the repositories table.
+    clone_url_override = None
+    if req.url and req.provider:
+        clone_url_override = oauth.build_authenticated_clone_url(current_user["id"], req.provider, req.url)
+
     # Schedule ingestion task
-    background_tasks.add_task(ingest_repository_task, repo_id, api_key)
+    background_tasks.add_task(ingest_repository_task, repo_id, api_key, clone_url_override)
     return {"repo_id": repo_id, "status": "pending"}
 
 @app.delete("/api/repositories/{repo_id}")
-def delete_repository(repo_id: int):
-    conn = db.get_db_connection()
-    cursor = conn.cursor()
-    cursor.execute("SELECT local_path, url FROM repositories WHERE id = ?", (repo_id,))
-    row = cursor.fetchone()
-    
-    if not row:
-        conn.close()
-        raise HTTPException(status_code=440, detail="Repository not found")
-        
-    local_path = row["local_path"]
-    is_cloned = bool(row["url"]) # If URL is set, we cloned it to uploads/
-    
-    # Delete from DB
-    cursor.execute("DELETE FROM repositories WHERE id = ?", (repo_id,))
-    conn.commit()
-    conn.close()
-    
+def delete_repository(repo_id: int, current_user: dict = Depends(auth.get_current_user)):
+    deleted = db.delete_repository(repo_id, current_user["id"])
+    if not deleted:
+        raise HTTPException(status_code=404, detail="Repository not found")
+
+    local_path = deleted["local_path"]
+    is_cloned = bool(deleted["url"])  # If URL is set, we cloned it to uploads/
+
     # Clean up cloned files from uploads folder
     if is_cloned and local_path and os.path.exists(local_path):
         try:
             shutil.rmtree(local_path)
         except Exception as e:
             logger.error(f"Could not delete local clone path {local_path}: {e}")
-            
+
     return {"success": True}
 
 @app.get("/api/repositories/{repo_id}/files")
-def get_repo_files(repo_id: int):
+def get_repo_files(repo_id: int, current_user: dict = Depends(auth.get_current_user)):
+    if not db.get_repository(repo_id, current_user["id"]):
+        raise HTTPException(status_code=404, detail="Repository not found")
+
     conn = db.get_db_connection()
     cursor = conn.cursor()
     cursor.execute("SELECT file_path, size_bytes, language FROM files WHERE repo_id = ?", (repo_id,))
     rows = cursor.fetchall()
     conn.close()
-    
+
     return [dict(r) for r in rows]
 
 @app.get("/api/repositories/{repo_id}/file")
-def get_file_content(repo_id: int, path: str = Query(...)):
+def get_file_content(repo_id: int, path: str = Query(...), current_user: dict = Depends(auth.get_current_user)):
+    if not db.get_repository(repo_id, current_user["id"]):
+        raise HTTPException(status_code=404, detail="Repository not found")
+
     conn = db.get_db_connection()
     cursor = conn.cursor()
     cursor.execute("SELECT file_path, content, language FROM files WHERE repo_id = ? AND file_path = ?", (repo_id, path))
     row = cursor.fetchone()
     conn.close()
-    
+
     if not row:
         raise HTTPException(status_code=404, detail=f"File {path} not found in index.")
-        
+
     return dict(row)
 
 @app.post("/api/agent/chat")
-def chat_with_agent(req: ChatRequest, authorization: Optional[str] = Header(None)):
-    api_key = get_api_key(authorization)
-    
-    # Retrieve repository paths
-    conn = db.get_db_connection()
-    cursor = conn.cursor()
-    cursor.execute("SELECT local_path FROM repositories WHERE id = ?", (req.repo_id,))
-    row = cursor.fetchone()
-    conn.close()
-    
-    if not row:
+def chat_with_agent(req: ChatRequest, current_user: dict = Depends(auth.get_current_user)):
+    api_key = get_api_key(current_user)
+
+    repository = db.get_repository(req.repo_id, current_user["id"])
+    if not repository:
         raise HTTPException(status_code=404, detail="Repository not found")
-        
-    local_path = row["local_path"]
-    
+
+    local_path = repository["local_path"]
+
     # Load chat history
     history = db.get_chat_history(req.repo_id, limit=10)
-    
+
     # Save user message to database
     db.save_chat_message(req.repo_id, "user", req.message)
-    
+
     # Instantiate agent with custom tool configs
     node_path = os.environ.get("NODE_PATH", "")
     python_path = os.environ.get("PYTHON_PATH", "")
-    
+
     agent = SoftwareAgent(
         api_key=api_key,
         repo_id=req.repo_id,
@@ -286,7 +303,7 @@ def chat_with_agent(req: ChatRequest, authorization: Optional[str] = Header(None
         node_path=node_path,
         python_path=python_path
     )
-    
+
     # Execute agent loop
     try:
         final_answer, steps = agent.run(req.message, history)
@@ -302,31 +319,36 @@ def chat_with_agent(req: ChatRequest, authorization: Optional[str] = Header(None
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/api/repositories/{repo_id}/chat-history")
-def get_chat_history(repo_id: int):
+def get_repo_chat_history(repo_id: int, current_user: dict = Depends(auth.get_current_user)):
+    if not db.get_repository(repo_id, current_user["id"]):
+        raise HTTPException(status_code=404, detail="Repository not found")
     return db.get_chat_history(repo_id)
 
 @app.get("/api/repositories/{repo_id}/endpoints")
-def discover_endpoints(repo_id: int):
+def discover_endpoints(repo_id: int, current_user: dict = Depends(auth.get_current_user)):
     import re
+    if not db.get_repository(repo_id, current_user["id"]):
+        raise HTTPException(status_code=404, detail="Repository not found")
+
     conn = db.get_db_connection()
     cursor = conn.cursor()
     cursor.execute("SELECT file_path, content FROM files WHERE repo_id = ?", (repo_id,))
     rows = cursor.fetchall()
     conn.close()
-    
+
     endpoints = []
     fastapi_pattern = re.compile(r'@(?:app|router|blueprint)\.(get|post|put|delete|patch|options|head)\(\s*["\']([^"\']+)["\']')
     express_pattern = re.compile(r'(?:app|router|route)\.(get|post|put|delete|patch|options|head|use)\(\s*["\']([^"\']+)["\']')
     rust_pattern = re.compile(r'#\[(get|post|put|delete|patch)\(\s*["\']([^"\']+)["\']\s*\)\]')
-    
+
     for row in rows:
         file_path = row["file_path"]
         content = row["content"]
-        
+
         lines = content.split('\n')
         for idx, line in enumerate(lines):
             line_no = idx + 1
-            
+
             m1 = fastapi_pattern.search(line)
             if m1:
                 method, path = m1.groups()
@@ -337,7 +359,7 @@ def discover_endpoints(repo_id: int):
                     "line_number": line_no
                 })
                 continue
-                
+
             m2 = express_pattern.search(line)
             if m2:
                 method, path = m2.groups()
@@ -348,7 +370,7 @@ def discover_endpoints(repo_id: int):
                     "line_number": line_no
                 })
                 continue
-                
+
             m3 = rust_pattern.search(line)
             if m3:
                 method, path = m3.groups()
@@ -359,55 +381,54 @@ def discover_endpoints(repo_id: int):
                     "line_number": line_no
                 })
                 continue
-                
+
     return endpoints
 
 @app.post("/api/repositories/{repo_id}/run-tests")
-def run_repository_tests(repo_id: int):
+def run_repository_tests(repo_id: int, current_user: dict = Depends(auth.get_current_user)):
     import run_tests
-    conn = db.get_db_connection()
-    cursor = conn.cursor()
-    cursor.execute("SELECT local_path FROM repositories WHERE id = ?", (repo_id,))
-    row = cursor.fetchone()
-    conn.close()
-    
-    if not row:
+    repository = db.get_repository(repo_id, current_user["id"])
+    if not repository:
         raise HTTPException(status_code=404, detail="Repository not found")
-        
-    local_path = row["local_path"]
+
+    local_path = repository["local_path"]
     node_path = os.environ.get("NODE_PATH", "")
     python_path = os.environ.get("PYTHON_PATH", "")
-    
+
     res = run_tests.execute_repo_tests(local_path, node_path, python_path)
     return res
 
 @app.post("/api/auth/signup")
-def auth_signup(payload: dict):
+def auth_signup(payload: dict, response: Response):
     email = payload.get("email", "").strip()
     password = payload.get("password", "").strip()
     name = payload.get("name", "").strip()
-    
+
     if not email or not password:
         raise HTTPException(status_code=400, detail="Email and password are required")
-        
-    success = db.create_user(email, password, name)
-    if not success:
+
+    user_id = db.create_user(email, auth.hash_password(password), name)
+    if not user_id:
         raise HTTPException(status_code=400, detail="Email address is already registered.")
-        
-    return {"success": True, "message": "User registered successfully."}
+
+    auth.set_session_cookie(response, user_id)
+    user = db.get_user_by_id(user_id)
+    return {"success": True, "user": {"id": user["id"], "email": user["email"], "name": user["name"], "avatar_url": user["avatar_url"]}}
 
 @app.post("/api/auth/signin")
-def auth_signin(payload: dict):
+def auth_signin(payload: dict, response: Response):
     email = payload.get("email", "").strip()
     password = payload.get("password", "").strip()
-    
+
     if not email or not password:
         raise HTTPException(status_code=400, detail="Email and password are required")
-        
-    user_data = db.verify_user(email, password)
-    if not user_data:
+
+    user = db.get_user_by_email(email)
+    if not user or not auth.verify_password(password, user["password"]):
         raise HTTPException(status_code=401, detail="Invalid email address or password.")
-        
-    return {"success": True, "user": user_data}
 
+    if not auth.is_bcrypt_hash(user["password"]):
+        db.set_user_password(user["id"], auth.hash_password(password))
 
+    auth.set_session_cookie(response, user["id"])
+    return {"success": True, "user": {"id": user["id"], "email": user["email"], "name": user["name"], "avatar_url": user["avatar_url"]}}

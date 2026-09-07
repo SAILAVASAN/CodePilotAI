@@ -1,28 +1,39 @@
-import React, { useState, useEffect } from 'react';
+import { useState, useEffect } from 'react';
+import { motion } from 'motion/react';
+import { toast } from 'sonner';
+import { GitBranch, Waypoints, Trash2, Database, ShieldCheck, Crosshair } from 'lucide-react';
+import { apiGet, apiPost, apiDelete } from '../lib/api';
+import ConfirmDialog from './ui/ConfirmDialog';
 
-export default function Dashboard({ onSelectRepo, selectedRepoId }) {
+const STATUS_STYLES = {
+  ready: 'text-success bg-emerald-500/10',
+  ingesting: 'text-accent bg-cyan-500/10',
+  cloning: 'text-warning bg-amber-500/10',
+  pending: 'text-warning bg-amber-500/10',
+  failed: 'text-danger bg-red-500/10',
+};
+
+export default function Dashboard({ onSelectRepo, selectedRepoId, onImportFromProvider }) {
   const [repos, setRepos] = useState([]);
   const [name, setName] = useState('');
   const [url, setUrl] = useState('');
   const [localPath, setLocalPath] = useState('');
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [error, setError] = useState('');
-  const [success, setSuccess] = useState('');
+  const [pendingDelete, setPendingDelete] = useState(null);
 
-  // Fetch repositories list
   const fetchRepos = async () => {
     try {
-      const response = await fetch('http://localhost:8000/api/repositories');
+      const response = await apiGet('/api/repositories');
       if (response.ok) {
         const data = await response.json();
         setRepos(data);
       }
     } catch (e) {
-      console.error("Error fetching repositories:", e);
+      console.error('Error fetching repositories:', e);
     }
   };
 
-  // Poll repos list to watch ingestion state
   useEffect(() => {
     fetchRepos();
     const interval = setInterval(fetchRepos, 3000);
@@ -32,37 +43,30 @@ export default function Dashboard({ onSelectRepo, selectedRepoId }) {
   const handleConnect = async (e) => {
     e.preventDefault();
     if (!name.trim()) {
-      setError("Please provide a codebase project name.");
+      setError('Please provide a codebase project name.');
       return;
     }
     if (!url && !localPath) {
-      setError("Please provide either a remote Git repository URL or a local folder path.");
+      setError('Please provide either a remote Git repository URL or a local folder path.');
       return;
     }
 
     setIsSubmitting(true);
     setError('');
-    setSuccess('');
 
     try {
-      const response = await fetch('http://localhost:8000/api/repositories', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json'
-        },
-        body: JSON.stringify({
-          name: name,
-          url: url || null,
-          local_path: localPath || null
-        })
+      const response = await apiPost('/api/repositories', {
+        name,
+        url: url || null,
+        local_path: localPath || null,
       });
 
       if (!response.ok) {
         const errData = await response.json();
-        throw new Error(errData.detail || "Failed to initiate repository connection.");
+        throw new Error(errData.detail || 'Failed to initiate repository connection.');
       }
 
-      setSuccess("Connection initialized. Ingestion process running in the background.");
+      toast.success('Connection initialized. Ingestion process running in the background.');
       setName('');
       setUrl('');
       setLocalPath('');
@@ -74,200 +78,215 @@ export default function Dashboard({ onSelectRepo, selectedRepoId }) {
     }
   };
 
-  const handleDelete = async (id, e) => {
-    e.stopPropagation();
-    if (!confirm("Are you sure you want to delete this repository index? This will clean up cached database chunks.")) {
-      return;
-    }
+  const handleDelete = async () => {
+    if (!pendingDelete) return;
     try {
-      const response = await fetch(`http://localhost:8000/api/repositories/${id}`, {
-        method: 'DELETE'
-      });
+      const response = await apiDelete(`/api/repositories/${pendingDelete.id}`);
       if (response.ok) {
+        toast.success(`"${pendingDelete.name}" index deleted.`);
         fetchRepos();
       } else {
-        alert("Failed to delete repository index.");
+        toast.error('Failed to delete repository index.');
       }
     } catch (err) {
       console.error(err);
-      alert("Error calling delete endpoint.");
+      toast.error('Error calling delete endpoint.');
+    } finally {
+      setPendingDelete(null);
     }
   };
 
   return (
-    <div style={{ display: 'flex', flexDirection: 'column', height: '100%', overflowY: 'auto', background: 'var(--bg-base)' }}>
-      <div className="dashboard-grid" style={{ flex: 1, padding: '1.5rem', display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '1.5rem' }}>
-        
+    <div className="flex h-full flex-col overflow-y-auto bg-bg-base">
+      <div className="grid flex-1 grid-cols-2 gap-6 p-6">
         {/* Connection Form Card */}
-        <div className="dashboard-card card-3d" style={{ height: 'fit-content' }}>
-          <h2 className="card-title" style={{ fontFamily: 'var(--font-heading)' }}>
-            <svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" style={{color: 'var(--primary)'}}><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg>
+        <motion.div
+          whileHover={{ y: -4 }}
+          className="h-fit rounded-2xl border border-border-glass bg-bg-surface p-6 shadow-card backdrop-blur-2xl transition-shadow"
+        >
+          <h2 className="mb-5 flex items-center gap-2 font-heading text-base font-semibold text-text-primary">
+            <GitBranch size={18} className="text-primary" />
             Connect Codebase Repository
           </h2>
-          
-          {error && <div style={{color: 'var(--danger)', padding: '0.75rem', background: 'rgba(239, 68, 68, 0.1)', borderRadius: '6px', marginBottom: '1rem', fontSize: '0.85rem'}}>{error}</div>}
-          {success && <div style={{color: 'var(--success)', padding: '0.75rem', background: 'rgba(16, 185, 129, 0.1)', borderRadius: '6px', marginBottom: '1rem', fontSize: '0.85rem'}}>{success}</div>}
 
-          <form onSubmit={handleConnect} className="ingest-form">
-            <div className="form-group">
-              <label>Project Name</label>
-              <input 
-                type="text" 
-                className="form-input" 
+          <div className="mb-5 flex gap-3">
+            <button
+              type="button"
+              onClick={() => onImportFromProvider?.('github')}
+              className="flex flex-1 items-center justify-center gap-2 rounded-lg border border-border-glass bg-bg-surface-hover py-2.5 text-sm font-semibold text-text-primary transition-transform hover:-translate-y-0.5"
+            >
+              <svg xmlns="http://www.w3.org/2000/svg" width="15" height="15" viewBox="0 0 24 24" fill="currentColor">
+                <path d="M12 0c-6.626 0-12 5.373-12 12 0 5.302 3.438 9.8 8.207 11.387.599.111.793-.261.793-.577v-2.234c-3.338.726-4.033-1.416-4.033-1.416-.546-1.387-1.333-1.756-1.333-1.756-1.089-.745.083-.729.083-.729 1.205.084 1.839 1.237 1.839 1.237 1.07 1.834 2.807 1.304 3.492.997.107-.775.418-1.305.762-1.604-2.665-.305-5.467-1.334-5.467-5.931 0-1.311.469-2.381 1.236-3.221-.124-.303-.535-1.524.117-3.176 0 0 1.008-.322 3.301 1.23.957-.266 1.983-.399 3.003-.404 1.02.005 2.047.138 3.006.404 2.291-1.552 3.297-1.23 3.297-1.23.653 1.653.242 2.874.118 3.176.77.84 1.235 1.911 1.235 3.221 0 4.609-2.807 5.624-5.479 5.921.43.372.823 1.102.823 2.222v3.293c0 .319.192.694.801.576 4.765-1.589 8.199-6.086 8.199-11.386 0-6.627-5.373-12-12-12z" />
+              </svg>
+              Import from GitHub
+            </button>
+            <button
+              type="button"
+              onClick={() => onImportFromProvider?.('gitlab')}
+              className="flex flex-1 items-center justify-center gap-2 rounded-lg border border-border-glass bg-bg-surface-hover py-2.5 text-sm font-semibold text-text-primary transition-transform hover:-translate-y-0.5"
+            >
+              <svg xmlns="http://www.w3.org/2000/svg" width="15" height="15" viewBox="0 0 24 24" fill="#FC6D26">
+                <path d="M22.65 14.39L12 22.13 1.35 14.39a.84.84 0 0 1-.3-.94l1.22-3.78 2.44-7.51A.42.42 0 0 1 4.82 2a.43.43 0 0 1 .58 0 .42.42 0 0 1 .11.18l2.44 7.49h8.1l2.44-7.51A.42.42 0 0 1 18.6 2a.43.43 0 0 1 .58 0 .42.42 0 0 1 .11.18l2.44 7.51L23 13.45a.84.84 0 0 1-.35.94z" />
+              </svg>
+              Import from GitLab
+            </button>
+          </div>
+
+          <div className="mb-5 text-center text-xs font-semibold text-text-muted">— OR PASTE A URL / LOCAL PATH —</div>
+
+          {error && (
+            <div className="mb-4 rounded-md bg-red-500/10 p-3 text-sm text-danger">{error}</div>
+          )}
+
+          <form onSubmit={handleConnect} className="flex flex-col gap-4">
+            <div className="flex flex-col gap-1.5">
+              <label className="text-sm font-medium text-text-secondary">Project Name</label>
+              <input
+                type="text"
                 placeholder="e.g. My Express App"
-                value={name} 
-                onChange={e => setName(e.target.value)} 
+                value={name}
+                onChange={(e) => setName(e.target.value)}
                 required
+                className="rounded-lg border border-border-glass bg-bg-input px-4 py-3 text-sm text-text-primary outline-none transition-shadow focus:border-primary focus:shadow-[0_0_0_3px_var(--primary-glow)]"
               />
             </div>
 
-            <div className="form-group">
-              <label>Git Remote Repository URL (HTTPS)</label>
-              <input 
-                type="url" 
-                className="form-input" 
+            <div className="flex flex-col gap-1.5">
+              <label className="text-sm font-medium text-text-secondary">Git Remote Repository URL (HTTPS)</label>
+              <input
+                type="url"
                 placeholder="e.g. https://github.com/expressjs/express.git"
-                value={url} 
-                onChange={e => setUrl(e.target.value)}
+                value={url}
+                onChange={(e) => setUrl(e.target.value)}
+                className="rounded-lg border border-border-glass bg-bg-input px-4 py-3 text-sm text-text-primary outline-none transition-shadow focus:border-primary focus:shadow-[0_0_0_3px_var(--primary-glow)]"
               />
             </div>
 
-            <div style={{textAlign: 'center', color: 'var(--text-muted)', fontSize: '0.8rem', fontWeight: 600, margin: '0.5rem 0'}}>— OR —</div>
+            <div className="my-1 text-center text-xs font-semibold text-text-muted">— OR —</div>
 
-            <div className="form-group">
-              <label>Local Codebase Folder Path (Windows)</label>
-              <input 
-                type="text" 
-                className="form-input" 
+            <div className="flex flex-col gap-1.5">
+              <label className="text-sm font-medium text-text-secondary">Local Codebase Folder Path (Windows)</label>
+              <input
+                type="text"
                 placeholder="e.g. C:\Projects\my-node-app"
-                value={localPath} 
-                onChange={e => setLocalPath(e.target.value)}
+                value={localPath}
+                onChange={(e) => setLocalPath(e.target.value)}
+                className="rounded-lg border border-border-glass bg-bg-input px-4 py-3 text-sm text-text-primary outline-none transition-shadow focus:border-primary focus:shadow-[0_0_0_3px_var(--primary-glow)]"
               />
             </div>
 
-            <button type="submit" className="btn-primary" disabled={isSubmitting} style={{ width: '100%', marginTop: '0.5rem', fontWeight: 700 }}>
-              {isSubmitting ? "Connecting..." : "Scan & Index Codebase"}
+            <button
+              type="submit"
+              disabled={isSubmitting}
+              className="mt-2 w-full rounded-lg bg-gradient-to-br from-primary to-primary-hover py-3 font-bold text-white shadow-[0_4px_12px_var(--primary-glow)] transition-transform hover:-translate-y-0.5 disabled:cursor-not-allowed disabled:opacity-50 disabled:hover:translate-y-0"
+            >
+              {isSubmitting ? 'Connecting...' : 'Scan & Index Codebase'}
             </button>
           </form>
-        </div>
+        </motion.div>
 
         {/* Active Repos Card */}
-        <div className="dashboard-card card-3d" style={{ height: 'fit-content' }}>
-          <h2 className="card-title" style={{ fontFamily: 'var(--font-heading)' }}>
-            <svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" style={{color: 'var(--accent)'}}><path d="M12 2v20M17 5H9.5a3.5 3.5 0 0 0 0 7h5a3.5 3.5 0 0 1 0 7H6"/></svg>
+        <motion.div
+          whileHover={{ y: -4 }}
+          className="h-fit rounded-2xl border border-border-glass bg-bg-surface p-6 shadow-card backdrop-blur-2xl transition-shadow"
+        >
+          <h2 className="mb-5 flex items-center gap-2 font-heading text-base font-semibold text-text-primary">
+            <Waypoints size={18} className="text-accent" />
             Active Repositories
           </h2>
 
           {repos.length === 0 ? (
-            <div style={{color: 'var(--text-muted)', textAlign: 'center', padding: '2rem 0', fontSize: '0.9rem'}}>
+            <div className="py-8 text-center text-sm text-text-muted">
               No repositories indexed yet. Connect one above to get started.
             </div>
           ) : (
-            <div className="repos-list" style={{ display: 'flex', flexDirection: 'column', gap: '0.75rem', maxHeight: '420px', overflowY: 'auto' }}>
-              {repos.map(r => (
-                <div 
-                  key={r.id} 
-                  className={`repo-item ${selectedRepoId === r.id ? 'active-border' : ''}`}
-                  style={{
-                    cursor: r.status === 'ready' ? 'pointer' : 'default',
-                    borderLeft: selectedRepoId === r.id ? '4px solid var(--primary)' : '1px solid var(--border-glass)',
-                    padding: '0.85rem 1.1rem',
-                    background: 'var(--bg-surface-hover)',
-                    border: '1px solid var(--border-glass)',
-                    borderRadius: '8px',
-                    display: 'flex',
-                    justifyContent: 'space-between',
-                    alignItems: 'center'
-                  }}
+            <div className="flex max-h-[420px] flex-col gap-3 overflow-y-auto">
+              {repos.map((r) => (
+                <div
+                  key={r.id}
                   onClick={() => r.status === 'ready' && onSelectRepo(r)}
+                  className={`flex items-center justify-between rounded-lg border p-4 transition-all ${
+                    r.status === 'ready' ? 'cursor-pointer' : 'cursor-default'
+                  } ${
+                    selectedRepoId === r.id
+                      ? 'border-l-4 border-primary bg-bg-surface-hover'
+                      : 'border-border-glass bg-bg-surface-hover hover:border-primary-glow hover:shadow-[0_0_12px_var(--primary-glow)]'
+                  }`}
                 >
-                  <div className="repo-info">
-                    <h3 style={{fontSize: '0.95rem', margin: 0, fontWeight: 700, color: selectedRepoId === r.id ? 'var(--primary)' : 'var(--text-primary)'}}>{r.name}</h3>
-                    <p style={{fontSize: '0.78rem', color: 'var(--text-secondary)', margin: '0.2rem 0 0 0'}}>{r.url ? `Git: ${r.url}` : `Local: ${r.local_path}`}</p>
-                    {r.error_message && <p style={{color: 'var(--danger)', fontSize: '0.75rem', marginTop: '0.2rem', margin: 0}}>{r.error_message}</p>}
+                  <div className="min-w-0">
+                    <h3 className={`truncate text-[0.95rem] font-bold ${selectedRepoId === r.id ? 'text-primary' : 'text-text-primary'}`}>
+                      {r.name}
+                    </h3>
+                    <p className="mt-0.5 truncate text-xs text-text-secondary">
+                      {r.url ? `Git: ${r.url}` : `Local: ${r.local_path}`}
+                    </p>
+                    {r.error_message && <p className="mt-0.5 text-xs text-danger">{r.error_message}</p>}
                   </div>
-                  
-                  <div style={{display: 'flex', alignItems: 'center', gap: '1rem'}}>
-                    <span className={`status-tag ${r.status}`} style={{
-                      fontSize: '0.7rem',
-                      padding: '0.2rem 0.55rem',
-                      borderRadius: '4px',
-                      textTransform: 'uppercase',
-                      fontWeight: 'bold',
-                      color: r.status === 'ready' ? 'var(--success)' : r.status === 'error' ? 'var(--danger)' : 'var(--warning)',
-                      background: r.status === 'ready' ? 'rgba(16, 185, 129, 0.12)' : r.status === 'error' ? 'rgba(239, 68, 68, 0.12)' : 'rgba(245, 158, 11, 0.12)'
-                    }}>
+
+                  <div className="flex shrink-0 items-center gap-4">
+                    <span className={`rounded px-2 py-0.5 text-[0.7rem] font-bold uppercase ${STATUS_STYLES[r.status] || STATUS_STYLES.pending}`}>
                       {r.status}
                     </span>
-                    
-                    <button className="btn-delete" onClick={(e) => handleDelete(r.id, e)} title="Delete Repo Index" style={{
-                      background: 'transparent',
-                      border: 'none',
-                      color: 'var(--text-secondary)',
-                      cursor: 'pointer'
-                    }}>
-                      <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/><line x1="10" y1="11" x2="10" y2="17"/><line x1="14" y1="11" x2="14" y2="17"/></svg>
+
+                    <button
+                      onClick={(e) => { e.stopPropagation(); setPendingDelete(r); }}
+                      title="Delete Repo Index"
+                      className="rounded-md p-1.5 text-text-secondary transition-colors hover:bg-red-500/10 hover:text-danger"
+                    >
+                      <Trash2 size={16} />
                     </button>
                   </div>
                 </div>
               ))}
             </div>
           )}
-        </div>
+        </motion.div>
       </div>
 
-      {/* Professional Theme-Aware Footer */}
-      <div style={{
-        padding: '1.5rem 2rem',
-        borderTop: '1px solid var(--border-glass)',
-        marginTop: 'auto',
-        display: 'flex',
-        justifyContent: 'space-between',
-        alignItems: 'center',
-        background: 'var(--bg-surface)',
-        boxShadow: 'var(--shadow-card)',
-        flexWrap: 'wrap',
-        gap: '1rem'
-      }}>
+      {/* Footer */}
+      <div className="mt-auto flex flex-wrap items-center justify-between gap-4 border-t border-border-glass bg-bg-surface p-6 shadow-card">
         <div>
-          <div style={{ fontFamily: 'var(--font-heading)', fontSize: '0.88rem', fontWeight: 800, color: 'var(--text-primary)', letterSpacing: '0.5px' }}>
+          <div className="font-heading text-sm font-extrabold tracking-wide text-text-primary">
             DevCopilot Intelligence Engine
           </div>
-          <div style={{ fontSize: '0.78rem', color: 'var(--text-secondary)', marginTop: '0.2rem' }}>
+          <div className="mt-0.5 text-xs text-text-secondary">
             Local-first codebase indexing & semantic verification.
           </div>
         </div>
-        
-        <div style={{ display: 'flex', gap: '2.5rem', flexWrap: 'wrap' }}>
+
+        <div className="flex flex-wrap gap-10">
           <div>
-            <div style={{ fontSize: '0.78rem', fontWeight: 700, color: 'var(--accent)', display: 'flex', alignItems: 'center', gap: '0.4rem' }}>
-              <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg>
+            <div className="flex items-center gap-1.5 text-xs font-bold text-accent">
+              <Database size={14} strokeWidth={2.5} />
               <span>SQLite Vector Store</span>
             </div>
-            <div style={{ fontSize: '0.72rem', color: 'var(--text-secondary)', marginTop: '0.15rem' }}>
-              Fast, portable semantic search
-            </div>
+            <div className="mt-0.5 text-[0.72rem] text-text-secondary">Fast, portable semantic search</div>
           </div>
           <div>
-            <div style={{ fontSize: '0.78rem', fontWeight: 700, color: 'var(--success)', display: 'flex', alignItems: 'center', gap: '0.4rem' }}>
-              <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>
+            <div className="flex items-center gap-1.5 text-xs font-bold text-success">
+              <ShieldCheck size={14} strokeWidth={2.5} />
               <span>Zero Code Export</span>
             </div>
-            <div style={{ fontSize: '0.72rem', color: 'var(--text-secondary)', marginTop: '0.15rem' }}>
-              Source stays 100% on your machine
-            </div>
+            <div className="mt-0.5 text-[0.72rem] text-text-secondary">Source stays 100% on your machine</div>
           </div>
           <div>
-            <div style={{ fontSize: '0.78rem', fontWeight: 700, color: 'var(--primary)', display: 'flex', alignItems: 'center', gap: '0.4rem' }}>
-              <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/></svg>
+            <div className="flex items-center gap-1.5 text-xs font-bold text-primary">
+              <Crosshair size={14} strokeWidth={2.5} />
               <span>Precise Citations</span>
             </div>
-            <div style={{ fontSize: '0.72rem', color: 'var(--text-secondary)', marginTop: '0.15rem' }}>
-              Direct file & line references
-            </div>
+            <div className="mt-0.5 text-[0.72rem] text-text-secondary">Direct file & line references</div>
           </div>
         </div>
       </div>
+
+      <ConfirmDialog
+        open={!!pendingDelete}
+        title="Delete repository index?"
+        message={`This will permanently remove "${pendingDelete?.name}" and its cached database chunks.`}
+        confirmLabel="Delete"
+        onConfirm={handleDelete}
+        onCancel={() => setPendingDelete(null)}
+      />
     </div>
   );
 }

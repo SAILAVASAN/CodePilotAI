@@ -42,14 +42,8 @@ class SoftwareAgent:
         self.python_path = python_path
         self.client = httpx.Client(timeout=60.0)
         
-        # Resolve embeddings client key
-        embed_key = api_key
-        if api_key.startswith("sk-"):
-            # Use backend's own Gemini key for embeddings (has high limit)
-            import os
-            embed_key = os.environ.get("GEMINI_API_KEY") or api_key
-            
-        self.rag_client = rag.GeminiClient(embed_key)
+        self.rag_client = rag.GeminiClient(rag.resolve_embedding_key(api_key))
+        self._embedding_model = None  # resolved lazily on first searchCode call
 
     def execute_tool(self, tool_name: str, args: dict) -> str:
         """Executes a tool on behalf of the agent and returns a text result."""
@@ -63,7 +57,9 @@ class SoftwareAgent:
                 if not all_chunks:
                     return "Error: No chunks found for this repository. Ingestion might have failed or is not complete."
                 
-                query_emb = self.rag_client.embed_text(query)
+                if self._embedding_model is None:
+                    self._embedding_model = self.rag_client.resolve_working_model()
+                query_emb = self.rag_client.embed_text(query, model=self._embedding_model)
                 results = rag.search_similar_chunks(query_emb, all_chunks, top_k=5)
                 
                 formatted = []

@@ -142,9 +142,6 @@ def init_db():
     conn.commit()
     conn.close()
 
-# ---------------------------------------------------------------------------
-# Users & sessions
-# ---------------------------------------------------------------------------
 
 def create_user(email, password_hash, name):
     """password_hash may be None for OAuth-only accounts created via upsert_oauth_user."""

@@ -9,6 +9,7 @@ import './App.css';
 import Dashboard from './components/Dashboard';
 import RepoExplorer from './components/RepoExplorer';
 import AgentChat from './components/AgentChat';
+import DebuggerStudio from './components/DebuggerStudio';
 import CodePreview from './components/CodePreview';
 import APIList from './components/APIList';
 import TestProof from './components/TestProof';
@@ -316,7 +317,10 @@ export default function App() {
                 {activeTab === 'debugging' && (
                   <>
                     <div className={`h-full ${activeFilePath ? 'w-1/2 border-r border-border-glass' : 'w-full'}`}>
-                      <AgentChat repoId={selectedRepo.id} onSelectCitation={handleCitationClick} />
+                      <DebuggerStudio
+                        repo={selectedRepo}
+                        onSelectCitation={handleCitationClick}
+                      />
                     </div>
                     {activeFilePath && (
                       <div className="h-full w-1/2">

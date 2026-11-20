@@ -27,6 +27,8 @@ import db
 import oauth
 import rag
 from agent import SoftwareAgent
+from debugging.agent import DebugAgent
+from execution.patch_applier import apply_code_patch, rollback_code_patch
 
 # Set up logging
 logging.basicConfig(
@@ -85,6 +87,12 @@ class ChatRequest(BaseModel):
     repo_id: int
     message: str
 
+class DebugSessionCreateRequest(BaseModel):
+    repo_id: int
+    error_message: str
+    stack_trace: Optional[str] = None
+    language: Optional[str] = None
+
 # Ingestion Worker
 def ingest_repository_task(repo_id: int, api_key: str, clone_url_override: Optional[str] = None):
     """Clones (if git URL) and ingests repository files and code chunks.
@@ -129,10 +137,14 @@ def ingest_repository_task(repo_id: int, api_key: str, clone_url_override: Optio
         db.save_files_batch(repo_id, files)
 
         all_chunks = []
+        all_symbols = []
         for f in files:
             chunks = rag.chunk_file(f["file_path"], f["content"], f["language"])
             all_chunks.extend(chunks)
-        logger.info(f"Generated {len(all_chunks)} chunks across {len(files)} files in repository {repo_id}")
+            symbols = rag.extract_symbols(f["file_path"], f["content"], f["language"])
+            all_symbols.extend(symbols)
+        logger.info(f"Generated {len(all_chunks)} chunks and {len(all_symbols)} symbols across {len(files)} files in repository {repo_id}")
+        db.save_symbols_batch(repo_id, all_symbols)
 
         rag_client = rag.GeminiClient(rag.resolve_embedding_key(api_key), max_concurrency=EMBEDDING_CONCURRENCY)
 
@@ -228,6 +240,18 @@ def connect_repository(req: RepoConnectRequest, background_tasks: BackgroundTask
     # Schedule ingestion task
     background_tasks.add_task(ingest_repository_task, repo_id, api_key, clone_url_override)
     return {"repo_id": repo_id, "status": "pending"}
+
+@app.post("/api/repositories/{repo_id}/reindex")
+def reindex_repository_endpoint(repo_id: int, background_tasks: BackgroundTasks, current_user: dict = Depends(auth.get_current_user)):
+    repo = db.get_repository(repo_id, current_user["id"])
+    if not repo:
+        raise HTTPException(status_code=404, detail="Repository not found")
+
+    api_key = get_api_key(current_user)
+    db.clear_repository_index(repo_id)
+    db.update_repo_status(repo_id, "pending")
+    background_tasks.add_task(ingest_repository_task, repo_id, api_key, None)
+    return {"repo_id": repo_id, "status": "pending", "message": "Reindexing started."}
 
 @app.delete("/api/repositories/{repo_id}")
 def delete_repository(repo_id: int, current_user: dict = Depends(auth.get_current_user)):
@@ -397,6 +421,161 @@ def run_repository_tests(repo_id: int, current_user: dict = Depends(auth.get_cur
 
     res = run_tests.execute_repo_tests(local_path, node_path, python_path)
     return res
+
+# ---------------------------------------------------------------------------
+# AI Debugging & Patch Verification Routes
+# ---------------------------------------------------------------------------
+
+@app.post("/api/debug/sessions")
+def create_debug_session_endpoint(req: DebugSessionCreateRequest, current_user: dict = Depends(auth.get_current_user)):
+    repo = db.get_repository(req.repo_id, current_user["id"])
+    if not repo:
+        raise HTTPException(status_code=404, detail="Repository not found")
+
+    session_id = db.create_debug_session(
+        repo_id=req.repo_id,
+        error_message=req.error_message,
+        stack_trace=req.stack_trace,
+        language=req.language
+    )
+    return {"session_id": session_id, "status": "pending"}
+
+@app.post("/api/debug/sessions/{session_id}/analyze")
+def analyze_debug_session_endpoint(session_id: int, current_user: dict = Depends(auth.get_current_user)):
+    session = db.get_debug_session(session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Debug session not found")
+
+    repo = db.get_repository(session["repo_id"], current_user["id"])
+    if not repo:
+        raise HTTPException(status_code=404, detail="Repository not found")
+
+    api_key = None
+    try:
+        api_key = get_api_key(current_user)
+    except Exception:
+        pass
+
+    agent = DebugAgent(repo_id=session["repo_id"], api_key=api_key)
+    try:
+        result = agent.run_investigation(
+            session_id=session_id,
+            error_message=session["error_message"],
+            stack_trace=session["stack_trace"],
+            language=session["language"]
+        )
+        return result
+    except Exception as e:
+        logger.error(f"Debug investigation failed: {e}", exc_info=True)
+        db.update_debug_session(session_id, status="failed", root_cause=str(e))
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/debug/sessions/{session_id}")
+def get_debug_session_details_endpoint(session_id: int, current_user: dict = Depends(auth.get_current_user)):
+    session = db.get_debug_session(session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Debug session not found")
+
+    repo = db.get_repository(session["repo_id"], current_user["id"])
+    if not repo:
+        raise HTTPException(status_code=404, detail="Repository not found")
+
+    evidence = db.get_debug_evidence(session_id)
+    patches = db.get_patches_for_session(session_id)
+
+    return {
+        "session": session,
+        "evidence": evidence,
+        "patches": patches
+    }
+
+@app.get("/api/repositories/{repo_id}/debug-sessions")
+def list_repo_debug_sessions_endpoint(repo_id: int, current_user: dict = Depends(auth.get_current_user)):
+    if not db.get_repository(repo_id, current_user["id"]):
+        raise HTTPException(status_code=404, detail="Repository not found")
+    return db.list_debug_sessions_for_repo(repo_id)
+
+@app.get("/api/repositories/{repo_id}/symbols")
+def get_repo_symbols_endpoint(repo_id: int, q: Optional[str] = None, current_user: dict = Depends(auth.get_current_user)):
+    if not db.get_repository(repo_id, current_user["id"]):
+        raise HTTPException(status_code=404, detail="Repository not found")
+    if q:
+        return db.find_symbols_by_name(repo_id, q)
+    return db.get_symbols_for_repo(repo_id)
+
+@app.post("/api/patches/{patch_id}/apply")
+def apply_patch_endpoint(patch_id: int, current_user: dict = Depends(auth.get_current_user)):
+    patch = db.get_patch(patch_id)
+    if not patch:
+        raise HTTPException(status_code=404, detail="Patch not found")
+
+    session = db.get_debug_session(patch["session_id"])
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    repo = db.get_repository(session["repo_id"], current_user["id"])
+    if not repo:
+        raise HTTPException(status_code=404, detail="Repository not found")
+
+    result = apply_code_patch(
+        repo_root=repo["local_path"],
+        file_path=patch["file_path"],
+        original_snippet=patch["original_content"],
+        replacement_snippet=patch["patched_content"]
+    )
+
+    if not result.get("success"):
+        raise HTTPException(status_code=400, detail=result.get("error", "Failed to apply patch."))
+
+    db.update_patch_status(patch_id, "applied")
+
+    # Run verification tests automatically
+    import run_tests
+    node_path = os.environ.get("NODE_PATH", "")
+    python_path = os.environ.get("PYTHON_PATH", "")
+    test_result = run_tests.execute_repo_tests(repo["local_path"], node_path, python_path)
+
+    status = "passed" if test_result.get("success") else "failed"
+    db.save_test_run(
+        repo_id=repo["id"],
+        session_id=session["id"],
+        command=test_result.get("runner", "auto-detect"),
+        status=status,
+        output=test_result.get("logs", ""),
+        duration_ms=0
+    )
+
+    return {
+        "success": True,
+        "patch": patch,
+        "verification_test": test_result
+    }
+
+@app.post("/api/patches/{patch_id}/reject")
+def reject_patch_endpoint(patch_id: int, current_user: dict = Depends(auth.get_current_user)):
+    patch = db.get_patch(patch_id)
+    if not patch:
+        raise HTTPException(status_code=404, detail="Patch not found")
+    db.update_patch_status(patch_id, "rejected")
+    return {"success": True}
+
+@app.post("/api/patches/{patch_id}/rollback")
+def rollback_patch_endpoint(patch_id: int, current_user: dict = Depends(auth.get_current_user)):
+    patch = db.get_patch(patch_id)
+    if not patch:
+        raise HTTPException(status_code=404, detail="Patch not found")
+
+    session = db.get_debug_session(patch["session_id"])
+    repo = db.get_repository(session["repo_id"], current_user["id"])
+    if not repo:
+        raise HTTPException(status_code=404, detail="Repository not found")
+
+    res = rollback_code_patch(repo["local_path"], patch["file_path"])
+    if not res.get("success"):
+        raise HTTPException(status_code=400, detail=res.get("error"))
+
+    db.update_patch_status(patch_id, "proposed")
+    return {"success": True, "message": "Patch rolled back."}
 
 @app.post("/api/auth/signup")
 def auth_signup(payload: dict, response: Response):

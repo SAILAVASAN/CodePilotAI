@@ -1,7 +1,7 @@
 import { useState, useEffect } from 'react';
 import { motion } from 'motion/react';
 import { toast } from 'sonner';
-import { GitBranch, Waypoints, Trash2, Database, ShieldCheck, Crosshair } from 'lucide-react';
+import { GitBranch, Waypoints, Trash2, Database, ShieldCheck, Crosshair, RefreshCw } from 'lucide-react';
 import { apiGet, apiPost, apiDelete } from '../lib/api';
 import ConfirmDialog from './ui/ConfirmDialog';
 
@@ -93,6 +93,22 @@ export default function Dashboard({ onSelectRepo, selectedRepoId, onImportFromPr
       toast.error('Error calling delete endpoint.');
     } finally {
       setPendingDelete(null);
+    }
+  };
+
+  const handleReindex = async (repo) => {
+    try {
+      toast.info(`Reindexing "${repo.name}"...`);
+      const response = await apiPost(`/api/repositories/${repo.id}/reindex`, {});
+      if (response.ok) {
+        toast.success(`Reindexing started for "${repo.name}".`);
+        fetchRepos();
+      } else {
+        const err = await response.json();
+        toast.error(err.detail || 'Failed to start reindexing.');
+      }
+    } catch (e) {
+      toast.error('Failed to trigger reindexing.');
     }
   };
 
@@ -223,10 +239,18 @@ export default function Dashboard({ onSelectRepo, selectedRepoId, onImportFromPr
                     {r.error_message && <p className="mt-0.5 text-xs text-danger">{r.error_message}</p>}
                   </div>
 
-                  <div className="flex shrink-0 items-center gap-4">
+                  <div className="flex shrink-0 items-center gap-2">
                     <span className={`rounded px-2 py-0.5 text-[0.7rem] font-bold uppercase ${STATUS_STYLES[r.status] || STATUS_STYLES.pending}`}>
                       {r.status}
                     </span>
+
+                    <button
+                      onClick={(e) => { e.stopPropagation(); handleReindex(r); }}
+                      title="Re-index Codebase"
+                      className="rounded-md p-1.5 text-text-secondary transition-colors hover:bg-primary/10 hover:text-primary"
+                    >
+                      <RefreshCw size={15} />
+                    </button>
 
                     <button
                       onClick={(e) => { e.stopPropagation(); setPendingDelete(r); }}

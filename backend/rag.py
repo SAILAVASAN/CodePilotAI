@@ -332,6 +332,70 @@ def chunk_file(file_path: str, content: str, language: str) -> list[dict]:
         
     return chunks
 
+def extract_symbols(file_path: str, content: str, language: str) -> list[dict]:
+    """Extracts function, class, and method symbols with line numbers and signatures."""
+    symbols = []
+    lines = content.split('\n')
+    
+    if language == 'python':
+        try:
+            tree = ast.parse(content)
+            for node in ast.walk(tree):
+                if isinstance(node, ast.ClassDef):
+                    start = node.lineno
+                    end = getattr(node, 'end_lineno', start)
+                    sig = lines[start - 1].strip() if start <= len(lines) else f"class {node.name}"
+                    symbols.append({
+                        "file_path": file_path,
+                        "name": node.name,
+                        "symbol_type": "class",
+                        "start_line": start,
+                        "end_line": end,
+                        "signature": sig
+                    })
+                elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    start = node.lineno
+                    end = getattr(node, 'end_lineno', start)
+                    sig = lines[start - 1].strip() if start <= len(lines) else f"def {node.name}"
+                    symbols.append({
+                        "file_path": file_path,
+                        "name": node.name,
+                        "symbol_type": "function",
+                        "start_line": start,
+                        "end_line": end,
+                        "signature": sig
+                    })
+        except Exception:
+            pass
+
+    elif language in ['javascript', 'typescript', 'go', 'rust', 'java', 'cpp', 'csharp']:
+        patterns = [
+            (re.compile(r'^\s*(?:export\s+|default\s+|async\s+)*function\s+([a-zA-Z0-9_]+)'), 'function'),
+            (re.compile(r'^\s*(?:export\s+)?(?:const|let|var)\s+([a-zA-Z0-9_]+)\s*=\s*(?:async\s*)?\('), 'function'),
+            (re.compile(r'^\s*(?:export\s+|default\s+)*class\s+([a-zA-Z0-9_]+)'), 'class'),
+            (re.compile(r'^\s*(?:export\s+)?interface\s+([a-zA-Z0-9_]+)'), 'interface'),
+            (re.compile(r'^\s*fn\s+([a-zA-Z0-9_]+)'), 'function'),
+            (re.compile(r'^\s*func\s+(?:\([^)]+\)\s+)?([a-zA-Z0-9_]+)'), 'function'),
+            (re.compile(r'^\s*(?:public|private|protected|static|\s)*[a-zA-Z0-9_<>]+\s+([a-zA-Z0-9_]+)\s*\('), 'method')
+        ]
+        for i, line in enumerate(lines):
+            for regex, sym_type in patterns:
+                m = regex.match(line)
+                if m:
+                    name = m.group(1)
+                    if name not in ('if', 'for', 'while', 'switch', 'catch'):
+                        symbols.append({
+                            "file_path": file_path,
+                            "name": name,
+                            "symbol_type": sym_type,
+                            "start_line": i + 1,
+                            "end_line": min(i + 30, len(lines)),
+                            "signature": line.strip()
+                        })
+                    break
+
+    return symbols
+
 def cosine_similarity(v1, v2):
     """Calculates cosine similarity between two 1D numpy arrays."""
     dot_product = np.dot(v1, v2)

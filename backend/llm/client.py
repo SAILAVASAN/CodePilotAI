@@ -93,18 +93,31 @@ class LLMClient:
             )
 
         models_to_try = [
+            os.environ.get("GEMINI_MODEL", "gemini-3.8-flash"),
+            "gemini-3.8-flash",
+            "gemini-3.5-flash",
             "gemini-2.5-flash",
             "gemini-2.0-flash",
             "gemini-1.5-flash"
         ]
+        # Remove duplicates while preserving order
+        seen = set()
+        unique_models = []
+        for m in models_to_try:
+            if m and m not in seen:
+                seen.add(m)
+                unique_models.append(m)
 
-        for model in models_to_try:
+        for model in unique_models:
             url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={self.gemini_api_key}"
             payload: Dict[str, Any] = {
+                "systemInstruction": {
+                    "parts": [{"text": system_prompt}]
+                },
                 "contents": [
                     {
                         "role": "user",
-                        "parts": [{"text": f"SYSTEM INSTRUCTIONS:\n{system_prompt}\n\nUSER PROMPT:\n{user_prompt}"}]
+                        "parts": [{"text": user_prompt}]
                     }
                 ],
                 "generationConfig": {

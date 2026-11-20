@@ -49,7 +49,7 @@ EXTENSION_LANGUAGES = {
     '.ps1': 'powershell'
 }
 
-EMBEDDING_MODELS = ["text-embedding-004", "gemini-embedding-2"]
+EMBEDDING_MODELS = ["gemini-embedding-2", "text-embedding-004"]
 
 
 def resolve_embedding_key(api_key: str) -> str:

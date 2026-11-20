@@ -146,6 +146,12 @@ def ingest_repository_task(repo_id: int, api_key: str, clone_url_override: Optio
         logger.info(f"Generated {len(all_chunks)} chunks and {len(all_symbols)} symbols across {len(files)} files in repository {repo_id}")
         db.save_symbols_batch(repo_id, all_symbols)
 
+        from debugging.dependency_analyzer import DependencyAnalyzer
+        dep_analyzer = DependencyAnalyzer({f["file_path"]: f for f in files})
+        deps = dep_analyzer.analyze_all_dependencies()
+        db.save_dependencies_batch(repo_id, deps)
+        logger.info(f"Recorded {len(deps)} dependencies for repository {repo_id}")
+
         rag_client = rag.GeminiClient(rag.resolve_embedding_key(api_key), max_concurrency=EMBEDDING_CONCURRENCY)
 
         embedded_chunks = []
@@ -502,6 +508,76 @@ def get_repo_symbols_endpoint(repo_id: int, q: Optional[str] = None, current_use
     if q:
         return db.find_symbols_by_name(repo_id, q)
     return db.get_symbols_for_repo(repo_id)
+
+@app.get("/api/repositories/{repo_id}/dependencies")
+def get_repo_dependencies_endpoint(repo_id: int, current_user: dict = Depends(auth.get_current_user)):
+    if not db.get_repository(repo_id, current_user["id"]):
+        raise HTTPException(status_code=404, detail="Repository not found")
+
+    deps = db.get_dependencies_for_repo(repo_id)
+
+    conn = db.get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT file_path, language, size_bytes FROM files WHERE repo_id = ?", (repo_id,))
+    files = {r["file_path"]: dict(r) for r in cursor.fetchall()}
+    conn.close()
+
+    nodes_dict = {}
+    for d in deps:
+        for fpath in (d["source_file"], d["target_file"]):
+            if fpath not in nodes_dict:
+                file_meta = files.get(fpath, {})
+                lower = fpath.lower()
+                category = "General"
+                if any(k in lower for k in ("controller", "route", "api", "endpoint")):
+                    category = "Controllers & Routes"
+                elif any(k in lower for k in ("service", "agent", "logic", "core", "manager")):
+                    category = "Services & Core"
+                elif any(k in lower for k in ("model", "schema", "entity", "dto")):
+                    category = "Models & Schemas"
+                elif any(k in lower for k in ("db", "database", "store", "sql", "migration")):
+                    category = "Database & Storage"
+                elif any(k in lower for k in ("component", "ui", "view", "page")):
+                    category = "Components & Views"
+                elif any(k in lower for k in ("test", "spec", "mock")):
+                    category = "Tests"
+
+                nodes_dict[fpath] = {
+                    "id": fpath,
+                    "name": os.path.basename(fpath),
+                    "file_path": fpath,
+                    "language": file_meta.get("language", "text"),
+                    "size_bytes": file_meta.get("size_bytes", 0),
+                    "category": category
+                }
+
+    edges = [
+        {
+            "id": f"{d['source_file']}->{d['target_file']}",
+            "source": d["source_file"],
+            "target": d["target_file"],
+            "relationship": d["relationship"],
+            "symbol": d["symbol_name"]
+        }
+        for d in deps
+    ]
+
+    return {
+        "nodes": list(nodes_dict.values()),
+        "edges": edges,
+        "total_relationships": len(edges)
+    }
+
+@app.post("/api/repositories/{repo_id}/impact-analysis")
+def get_impact_analysis_endpoint(repo_id: int, payload: dict, current_user: dict = Depends(auth.get_current_user)):
+    if not db.get_repository(repo_id, current_user["id"]):
+        raise HTTPException(status_code=404, detail="Repository not found")
+
+    file_path = payload.get("file_path", "").strip()
+    if not file_path:
+        raise HTTPException(status_code=400, detail="file_path is required")
+
+    return db.get_file_impact(repo_id, file_path)
 
 @app.post("/api/patches/{patch_id}/apply")
 def apply_patch_endpoint(patch_id: int, current_user: dict = Depends(auth.get_current_user)):

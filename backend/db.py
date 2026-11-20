@@ -148,6 +148,18 @@ def init_db():
     """)
 
     cursor.execute("""
+    CREATE TABLE IF NOT EXISTS dependencies (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        repo_id INTEGER NOT NULL,
+        source_file TEXT NOT NULL,
+        target_file TEXT NOT NULL,
+        relationship TEXT NOT NULL,
+        symbol_name TEXT,
+        FOREIGN KEY (repo_id) REFERENCES repositories (id) ON DELETE CASCADE
+    )
+    """)
+
+    cursor.execute("""
     CREATE TABLE IF NOT EXISTS debug_sessions (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         repo_id INTEGER NOT NULL,
@@ -226,6 +238,9 @@ def init_db():
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_repositories_user ON repositories(user_id)")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_symbols_repo ON code_symbols(repo_id)")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_symbols_name ON code_symbols(name)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_deps_repo ON dependencies(repo_id)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_deps_source ON dependencies(source_file)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_deps_target ON dependencies(target_file)")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_debug_repo ON debug_sessions(repo_id)")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_evidence_session ON debug_evidence(session_id)")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_patches_session ON patches(session_id)")
@@ -281,6 +296,30 @@ def _backfill_symbols_and_fts(cursor):
                 [(r["file_path"], r["content"], str(r["repo_id"])) for r in rows]
             )
             logger.info(f"Successfully backfilled {len(rows)} files into FTS5 index.")
+
+        cursor.execute("SELECT COUNT(*) FROM dependencies")
+        dep_count = cursor.fetchone()[0]
+        cursor.execute("SELECT COUNT(*) FROM files")
+        file_count = cursor.fetchone()[0]
+        if dep_count == 0 and file_count > 0:
+            cursor.execute("SELECT repo_id, file_path, content, language FROM files")
+            rows = cursor.fetchall()
+            from debugging.dependency_analyzer import DependencyAnalyzer
+            # Group by repo_id
+            by_repo = {}
+            for r in rows:
+                by_repo.setdefault(r["repo_id"], {})[r["file_path"]] = dict(r)
+            all_deps = []
+            for r_id, r_files in by_repo.items():
+                analyzer = DependencyAnalyzer(r_files)
+                for edge in analyzer.analyze_all_dependencies():
+                    all_deps.append((r_id, edge["source_file"], edge["target_file"], edge["relationship"], edge.get("symbol_name")))
+            if all_deps:
+                cursor.executemany(
+                    "INSERT INTO dependencies (repo_id, source_file, target_file, relationship, symbol_name) VALUES (?, ?, ?, ?, ?)",
+                    all_deps
+                )
+                logger.info(f"Successfully backfilled {len(all_deps)} dependencies.")
     except Exception as e:
         logger.warning(f"Backfill skipped or failed: {e}")
 
@@ -464,6 +503,7 @@ def clear_repository_index(repo_id):
     cursor.execute("DELETE FROM files WHERE repo_id = ?", (repo_id,))
     cursor.execute("DELETE FROM chunks WHERE repo_id = ?", (repo_id,))
     cursor.execute("DELETE FROM code_symbols WHERE repo_id = ?", (repo_id,))
+    cursor.execute("DELETE FROM dependencies WHERE repo_id = ?", (repo_id,))
     try:
         cursor.execute("DELETE FROM files_fts WHERE repo_id = ?", (str(repo_id),))
     except Exception:
@@ -812,4 +852,66 @@ def get_test_runs(repo_id, session_id=None, limit=20):
     rows = [dict(r) for r in cursor.fetchall()]
     conn.close()
     return rows
+
+# ---------------------------------------------------------------------------
+# Code Dependencies & Impact Analysis
+# ---------------------------------------------------------------------------
+
+def save_dependencies_batch(repo_id, dependencies):
+    """dependencies: list of {source_file, target_file, relationship, symbol_name}."""
+    if not dependencies:
+        return
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.executemany(
+        """INSERT INTO dependencies (repo_id, source_file, target_file, relationship, symbol_name)
+           VALUES (?, ?, ?, ?, ?)""",
+        [(repo_id, d["source_file"], d["target_file"], d.get("relationship", "imports"), d.get("symbol_name"))
+         for d in dependencies]
+    )
+    conn.commit()
+    conn.close()
+
+def get_dependencies_for_repo(repo_id):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        "SELECT id, source_file, target_file, relationship, symbol_name FROM dependencies WHERE repo_id = ?",
+        (repo_id,)
+    )
+    rows = [dict(r) for r in cursor.fetchall()]
+    conn.close()
+    return rows
+
+def get_file_impact(repo_id, file_path):
+    """
+    Returns files directly dependent on this file (upstream callers/importers)
+    and files this file depends on (downstream dependencies).
+    """
+    clean_path = file_path.replace("\\", "/").strip().lstrip("/")
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    # Upstream: who imports/calls me?
+    cursor.execute(
+        "SELECT DISTINCT source_file, relationship, symbol_name FROM dependencies WHERE repo_id = ? AND target_file = ?",
+        (repo_id, clean_path)
+    )
+    upstream = [dict(r) for r in cursor.fetchall()]
+
+    # Downstream: who do I import/call?
+    cursor.execute(
+        "SELECT DISTINCT target_file, relationship, symbol_name FROM dependencies WHERE repo_id = ? AND source_file = ?",
+        (repo_id, clean_path)
+    )
+    downstream = [dict(r) for r in cursor.fetchall()]
+    conn.close()
+
+    return {
+        "file_path": clean_path,
+        "affected_by_changes": upstream,
+        "depends_on": downstream,
+        "blast_radius_count": len(upstream)
+    }
+
 

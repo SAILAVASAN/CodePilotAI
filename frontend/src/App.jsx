@@ -345,7 +345,10 @@ export default function App() {
                       />
                     </div>
                     <div className={`h-full ${activeFilePath ? 'w-[38%] border-r border-border-glass' : 'w-[70%]'}`}>
-                      <ArchDiagram onSelectFile={(file, line) => { setActiveFilePath(file); setHighlightLineRange(line); }} />
+                      <ArchDiagram
+                        repoId={selectedRepo.id}
+                        onSelectFile={(file, line) => { setActiveFilePath(file); setHighlightLineRange(line); }}
+                      />
                     </div>
                     {activeFilePath && (
                       <div className="h-full w-2/5">

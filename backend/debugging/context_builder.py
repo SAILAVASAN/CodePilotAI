@@ -106,18 +106,19 @@ class ContextBuilder:
                     })
                     affected_files_set.add(fpath)
 
-        # Step 4: Semantic chunk retrieval for conceptual context
-        semantic_chunks = self._get_semantic_chunks(error_message, rag_client)
-        for sc in semantic_chunks:
-            evidence_list.append({
-                "file_path": sc["file_path"],
-                "start_line": sc["start_line"],
-                "end_line": sc["end_line"],
-                "code_snippet": sc["text"],
-                "evidence_type": "semantic_match",
-                "relevance_score": round(sc["score"], 2)
-            })
-            affected_files_set.add(sc["file_path"])
+        # Step 4: Semantic chunk retrieval for conceptual context (only if stack trace evidence is sparse)
+        if len(evidence_list) < 2 and rag_client:
+            semantic_chunks = self._get_semantic_chunks(error_message, rag_client)
+            for sc in semantic_chunks:
+                evidence_list.append({
+                    "file_path": sc["file_path"],
+                    "start_line": sc["start_line"],
+                    "end_line": sc["end_line"],
+                    "code_snippet": sc["text"],
+                    "evidence_type": "semantic_match",
+                    "relevance_score": round(sc["score"], 2)
+                })
+                affected_files_set.add(sc["file_path"])
 
         # Step 5: Format structured prompt context for LLM
         prompt_context = self._format_prompt_context(parsed, evidence_list)

@@ -1,3 +1,4 @@
+import os
 import json
 import logging
 import httpx
@@ -8,32 +9,33 @@ import run_tests
 logger = logging.getLogger(__name__)
 
 # Agent System Prompt
-SYSTEM_PROMPT = """You are CodePilot, a senior software engineering assistant.
-Your goal is to help developers understand, debug, and build their codebase.
+SYSTEM_PROMPT = """You are CodePilot, a fast, highly capable senior software engineering assistant.
+Your goal is to help developers understand, build, and debug their codebase quickly and accurately.
 Always communicate clearly, professionally, and directly like an expert software engineer.
-Never use robotic artificial disclaimers or fluff phrases.
+Never use robotic artificial disclaimers or conversational fluff.
 
-Always ground your answers in exact codebase evidence.
-Do not hallucinate file paths, libraries, configuration, or API endpoints.
-If you cannot find the answer in the code or documents using your tools, state that there is insufficient codebase evidence.
-Always format file citations as `[file_path:line_range]` or `[file_path]` so the UI can highlight the file for the user.
-
-You should perform step-by-step reasoning. To achieve this, call tools sequentially in a loop.
-At each step, output:
-1. Your "thought" explaining what you are looking for and why.
-2. An optional "tool" call (searchCode, getFile, getDependencies, runTests) with its "args".
-3. A final "answer" when you have gathered enough information.
+RESPONSE & SPEED PRINCIPLES:
+1. Fast Direct Answer: If the user's question can be answered from the Repository Files Tree, general programming knowledge, or past conversation history (e.g. project structure, framework identification, configuration, file paths), respond IMMEDIATELY with tool 'none' and provide the complete answer in your very first turn.
+2. Targeted Tool Execution: Only invoke a tool when you genuinely need specific file code or live test output.
+   - Use 'getFile' when you already know or can deduce the target file path.
+   - Use 'searchCode' to find functions, classes, symbols, or phrases across the codebase.
+   - Use 'getDependencies' when asked about packages, versions, or libraries.
+   - Use 'runTests' when asked to execute or verify unit tests.
+3. Codebase Grounding: Always cite actual file paths and line ranges as `[file_path:line_range]` or `[file_path]`. Never hallucinate non-existent files or functions.
+4. Professional Engineering Style: Tailor your response directly to what was asked. Keep explanations crisp, actionable, and formatted with clean markdown codeblocks.
 
 Available tools:
-- searchCode(query): Search all file chunks using semantic vector search. Returns files and relevant chunks.
-- getFile(file_path): Fetch the complete content of a specific file. Useful for reading entire code files.
-- getDependencies(): Scan dependency files (like package.json, requirements.txt, Cargo.toml) to identify packages used.
-- runTests(): Runs the tests in the repository and returns output logs. Useful to verify fixes or find failing tests.
+- searchCode(query): Search symbols, full-text code, or semantic chunks. Returns matching code snippets.
+- getFile(file_path): Fetch the complete content of a specific file.
+- getDependencies(): Scan dependency files (package.json, requirements.txt, Cargo.toml, etc.) to list external packages.
+- runTests(): Runs the tests in the repository and returns output logs.
 
 Return your response as a single JSON object matching the requested schema.
 """
 
 class SoftwareAgent:
+    _working_gemini_model: str = None
+
     def __init__(self, api_key: str, repo_id: int, local_path: str, node_path: str = None, python_path: str = None):
         self.api_key = api_key
         self.repo_id = repo_id
@@ -44,18 +46,47 @@ class SoftwareAgent:
         
         self.rag_client = rag.GeminiClient(rag.resolve_embedding_key(api_key))
         self._embedding_model = None  # resolved lazily on first searchCode call
+        self._cached_chunks = None
 
     def execute_tool(self, tool_name: str, args: dict) -> str:
         """Executes a tool on behalf of the agent and returns a text result."""
         try:
             if tool_name == "searchCode":
-                query = args.get("query", "")
+                query = args.get("query", "").strip()
                 if not query:
                     return "Error: Empty query parameter for searchCode."
-                
-                all_chunks = db.get_chunks_for_repo(self.repo_id)
+
+                # Fast Path 1: Check exact code symbols table (< 1ms)
+                symbols = db.find_symbols_by_name(self.repo_id, query)
+                if symbols:
+                    formatted = [f"Found exact code symbol matches for '{query}':"]
+                    for idx, s in enumerate(symbols[:5]):
+                        formatted.append(
+                            f"Match #{idx+1} [Symbol: {s['symbol_type']}]\n"
+                            f"File: {s['file_path']} (Lines {s['start_line']}-{s['end_line']})\n"
+                            f"Name: {s['name']} | Signature: {s.get('signature', '')}\n"
+                        )
+                    return "\n".join(formatted)
+
+                # Fast Path 2: Full-Text Search in SQLite FTS5 (< 2ms)
+                fts_matches = db.search_code_fts(self.repo_id, query, limit=5)
+                if fts_matches:
+                    formatted = [f"Found full-text matches for '{query}':"]
+                    for idx, m in enumerate(fts_matches):
+                        clean_snippet = m.get("snippet", "").replace("<b>", "").replace("</b>", "")
+                        formatted.append(
+                            f"Match #{idx+1} [FTS]\n"
+                            f"File: {m['file_path']}\n"
+                            f"```\n{clean_snippet}\n```\n"
+                        )
+                    return "\n".join(formatted)
+
+                # Fallback: Semantic Vector Search
+                if self._cached_chunks is None:
+                    self._cached_chunks = db.get_chunks_for_repo(self.repo_id)
+                all_chunks = self._cached_chunks
                 if not all_chunks:
-                    return "Error: No chunks found for this repository. Ingestion might have failed or is not complete."
+                    return "No matching code chunks found in repository index."
                 
                 if self._embedding_model is None:
                     self._embedding_model = self.rag_client.resolve_working_model()
@@ -188,8 +219,8 @@ class SoftwareAgent:
             "parts": [{"text": user_query}]
         })
 
-        # Keep track of agent steps
-        loop_limit = 6
+        # Keep track of agent steps (keep loop tight for fast user responses)
+        loop_limit = 4
         step_index = 0
 
         while step_index < loop_limit:
@@ -234,31 +265,50 @@ class SoftwareAgent:
                     logger.error(f"Error calling or parsing Moonshot API: {e}")
                     return f"An error occurred while consulting the Moonshot AI agent: {str(e)}", steps
             else:
-                # Invoke Gemini API
-                url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash:generateContent?key={self.api_key}"
-                headers = {"Content-Type": "application/json"}
-                
-                payload = {
-                    "systemInstruction": system_instruction,
-                    "contents": contents,
-                    "generationConfig": {
-                        "responseMimeType": "application/json",
-                        "responseSchema": schema,
-                        "temperature": 0.2
-                    }
-                }
+                # Invoke Gemini API with prioritized fast model fallback
+                models_to_try = [
+                    SoftwareAgent._working_gemini_model,
+                    os.environ.get("GEMINI_MODEL", "gemini-3.8-flash"),
+                    "gemini-3.8-flash",
+                    "gemini-3.5-flash"
+                ]
+                seen = set()
+                unique_models = [m for m in models_to_try if m and not (m in seen or seen.add(m))]
 
-                try:
-                    response = self.client.post(url, json=payload, headers=headers)
-                    if response.status_code != 200:
-                        raise Exception(f"Gemini API error ({response.status_code}): {response.text}")
-                    
-                    res_data = response.json()
-                    content_text = res_data["candidates"][0]["content"]["parts"][0]["text"]
-                    parsed = json.loads(content_text)
-                except Exception as e:
-                    logger.error(f"Error calling or parsing Gemini API: {e}")
-                    return f"An error occurred while consulting the AI agent: {str(e)}", steps
+                content_text = None
+                parsed = None
+                last_err = None
+
+                for model in unique_models:
+                    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={self.api_key}"
+                    headers = {"Content-Type": "application/json"}
+                    payload = {
+                        "systemInstruction": system_instruction,
+                        "contents": contents,
+                        "generationConfig": {
+                            "responseMimeType": "application/json",
+                            "responseSchema": schema,
+                            "temperature": 0.2
+                        }
+                    }
+
+                    try:
+                        response = self.client.post(url, json=payload, headers=headers)
+                        if response.status_code == 200:
+                            res_data = response.json()
+                            content_text = res_data["candidates"][0]["content"]["parts"][0]["text"]
+                            parsed = json.loads(content_text)
+                            SoftwareAgent._working_gemini_model = model
+                            break
+                        else:
+                            last_err = f"Gemini API ({model}) returned {response.status_code}: {response.text}"
+                            logger.warning(last_err)
+                    except Exception as e:
+                        last_err = str(e)
+                        logger.warning(f"Error calling Gemini {model}: {e}")
+
+                if parsed is None:
+                    return f"An error occurred while consulting the AI agent: {last_err}", steps
 
             # Add LLM response to chat history as 'model'
             contents.append({

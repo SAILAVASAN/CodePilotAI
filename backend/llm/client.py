@@ -1,5 +1,6 @@
 import os
 import json
+import time
 import logging
 import httpx
 from typing import Dict, Any, List, Optional
@@ -7,6 +8,10 @@ from typing import Dict, Any, List, Optional
 logger = logging.getLogger(__name__)
 
 class LLMClient:
+    _ollama_checked_at: float = 0.0
+    _ollama_cached_status: bool = False
+    _working_gemini_model: Optional[str] = None
+
     def __init__(self, api_key: Optional[str] = None):
         self.ollama_base_url = os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434").rstrip("/")
         self.code_model = os.environ.get("CODE_MODEL", "qwen2.5-coder")
@@ -15,12 +20,19 @@ class LLMClient:
         self.client = httpx.Client(timeout=120.0)
 
     def is_ollama_available(self) -> bool:
-        """Checks if local Ollama daemon is running and responsive."""
+        """Checks if local Ollama daemon is running with a 30s TTL cache to avoid blocking latency."""
+        now = time.time()
+        if now - LLMClient._ollama_checked_at < 30.0:
+            return LLMClient._ollama_cached_status
+
         try:
-            resp = self.client.get(f"{self.ollama_base_url}/api/tags", timeout=1.5)
-            return resp.status_code == 200
+            resp = self.client.get(f"{self.ollama_base_url}/api/tags", timeout=0.25)
+            LLMClient._ollama_cached_status = (resp.status_code == 200)
         except Exception:
-            return False
+            LLMClient._ollama_cached_status = False
+
+        LLMClient._ollama_checked_at = now
+        return LLMClient._ollama_cached_status
 
     def generate_chat(self, system_prompt: str, user_prompt: str, response_format_json: bool = True) -> str:
         """
@@ -93,14 +105,12 @@ class LLMClient:
             )
 
         models_to_try = [
+            LLMClient._working_gemini_model,
             os.environ.get("GEMINI_MODEL", "gemini-3.8-flash"),
             "gemini-3.8-flash",
-            "gemini-3.5-flash",
-            "gemini-2.5-flash",
-            "gemini-2.0-flash",
-            "gemini-1.5-flash"
+            "gemini-3.5-flash"
         ]
-        # Remove duplicates while preserving order
+        # Remove duplicates and None while preserving order
         seen = set()
         unique_models = []
         for m in models_to_try:
@@ -135,6 +145,7 @@ class LLMClient:
                     if candidates:
                         parts = candidates[0].get("content", {}).get("parts", [])
                         if parts:
+                            LLMClient._working_gemini_model = model
                             return parts[0].get("text", "")
                 logger.warning(f"Gemini {model} returned status {resp.status_code}: {resp.text}")
             except Exception as e:

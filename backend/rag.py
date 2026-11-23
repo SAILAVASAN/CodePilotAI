@@ -62,6 +62,8 @@ def resolve_embedding_key(api_key: str) -> str:
 
 
 class GeminiClient:
+    _cached_working_model: str = None
+
     def __init__(self, api_key: str, max_concurrency: int = 8):
         self.api_key = api_key
         # A generous connection pool so the ingestion thread pool can actually
@@ -84,10 +86,14 @@ class GeminiClient:
         """Finds which embedding model this API key can actually use. Call this
         once, synchronously, before embedding chunks concurrently — probing per
         chunk from multiple threads would race on which model "won"."""
+        if GeminiClient._cached_working_model:
+            return GeminiClient._cached_working_model
+
         for model in EMBEDDING_MODELS:
             try:
                 response = self._post_embed(model, "ping")
                 if response.status_code == 200:
+                    GeminiClient._cached_working_model = model
                     return model
                 logger.warning(f"Model {model} embedding failed: {response.text}")
             except Exception as e:

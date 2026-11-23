@@ -153,10 +153,18 @@ class DebugAgent:
             conn.close()
 
             if file_row:
-                full_content = file_row["content"]
-                patched_full = full_content.replace(orig_snip.strip(), repl_snip.strip(), 1) if orig_snip else full_content
+                full_content = file_row["content"].replace("\r\n", "\n")
+                clean_orig = orig_snip.strip().replace("\r\n", "\n")
+                clean_repl = repl_snip.strip().replace("\r\n", "\n")
+                if clean_orig and clean_orig in full_content:
+                    patched_full = full_content.replace(clean_orig, clean_repl, 1)
+                else:
+                    patched_full = full_content
                 diff_str = generate_unified_diff(full_content, patched_full, patch_file)
             else:
+                diff_str = generate_unified_diff(orig_snip, repl_snip, patch_file)
+
+            if not diff_str or not diff_str.strip():
                 diff_str = generate_unified_diff(orig_snip, repl_snip, patch_file)
 
             patch_id = db.create_patch(

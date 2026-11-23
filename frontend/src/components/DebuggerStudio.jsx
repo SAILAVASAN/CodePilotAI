@@ -22,14 +22,17 @@ export default function DebuggerStudio({ repo, onSelectCitation }) {
   const [patchApplying, setPatchApplying] = useState(false);
   const [testResult, setTestResult] = useState(null);
 
-  const repoId = repo.id;
+  const repoId = repo?.id;
 
   // Load past debug sessions on mount or repo change
   useEffect(() => {
-    loadSessionsHistory();
+    if (repoId) {
+      loadSessionsHistory();
+    }
   }, [repoId]);
 
   const loadSessionsHistory = async () => {
+    if (!repoId) return;
     try {
       const resp = await apiGet(`/api/repositories/${repoId}/debug-sessions`);
       if (resp.ok) {
@@ -178,6 +181,14 @@ export default function DebuggerStudio({ repo, onSelectCitation }) {
       setLanguage('python');
     }
   };
+
+  if (!repo) {
+    return (
+      <div className="flex h-full items-center justify-center p-8 text-center text-text-muted">
+        Select a repository to start debugging.
+      </div>
+    );
+  }
 
   if (mode === 'chat') {
     return (

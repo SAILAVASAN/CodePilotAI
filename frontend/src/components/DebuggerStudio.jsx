@@ -2,7 +2,7 @@ import { useState, useEffect } from 'react';
 import {
   Bug, Play, CheckCircle2, XCircle, AlertTriangle, ShieldCheck,
   FileCode, Sparkles, ArrowRight, RotateCcw, Check, RefreshCw,
-  Layers, Terminal, MessageSquare, ChevronRight
+  Layers, Terminal, MessageSquare, ChevronRight, UploadCloud, GitCommit
 } from 'lucide-react';
 import { toast } from 'sonner';
 import { apiGet, apiPost } from '../lib/api';
@@ -20,6 +20,7 @@ export default function DebuggerStudio({ repo, onSelectCitation }) {
   const [patches, setPatches] = useState([]);
   const [sessionsHistory, setSessionsHistory] = useState([]);
   const [patchApplying, setPatchApplying] = useState(false);
+  const [pushingPatchId, setPushingPatchId] = useState(null);
   const [testResult, setTestResult] = useState(null);
 
   const repoId = repo?.id;
@@ -158,6 +159,26 @@ export default function DebuggerStudio({ repo, onSelectCitation }) {
       setTestResult(null);
     } catch (e) {
       toast.error(e.message || 'Rollback failed.');
+    }
+  };
+
+  const handlePushPatch = async (patchId) => {
+    setPushingPatchId(patchId);
+    try {
+      const resp = await apiPost(`/api/patches/${patchId}/push`, {});
+      if (!resp.ok) {
+        const err = await resp.json();
+        throw new Error(err.detail || 'Push to remote failed.');
+      }
+      const data = await resp.json();
+      toast.success(data.message || 'Patch committed and pushed to remote GitHub repository!');
+      setPatches((prev) =>
+        prev.map((p) => (p.id === patchId ? { ...p, status: 'pushed' } : p))
+      );
+    } catch (e) {
+      toast.error(e.message || 'Push failed.');
+    } finally {
+      setPushingPatchId(null);
     }
   };
 
@@ -493,6 +514,7 @@ export default function DebuggerStudio({ repo, onSelectCitation }) {
             <div className="rounded-xl border border-border-glass bg-bg-surface p-5 shadow-sm">
               {patches.map((patch) => {
                 const isApplied = patch.status === 'applied';
+                const isPushed = patch.status === 'pushed';
                 return (
                   <div key={patch.id} className="flex flex-col gap-3">
                     <div className="flex items-center justify-between border-b border-border-glass pb-3">
@@ -501,19 +523,54 @@ export default function DebuggerStudio({ repo, onSelectCitation }) {
                           Patch: {patch.file_path}
                         </span>
                         <div className="text-[0.7rem] text-text-muted">
-                          Status: <span className={isApplied ? 'text-success font-bold' : 'text-accent font-bold'}>{patch.status.toUpperCase()}</span>
+                          Status: <span className={isPushed ? 'text-primary font-bold' : isApplied ? 'text-success font-bold' : 'text-accent font-bold'}>{patch.status.toUpperCase()}</span>
                         </div>
                       </div>
 
                       <div className="flex items-center gap-2">
-                        {isApplied ? (
-                          <button
-                            onClick={() => handleRollbackPatch(patch.id)}
-                            className="flex items-center gap-1.5 rounded-lg border border-border-glass bg-bg-input px-3 py-1.5 text-xs font-semibold text-text-secondary hover:border-accent hover:text-accent"
-                          >
-                            <RotateCcw size={13} />
-                            Rollback Fix
-                          </button>
+                        {isPushed ? (
+                          <>
+                            <span className="flex items-center gap-1.5 rounded-lg border border-primary/30 bg-primary/10 px-3 py-1.5 text-xs font-bold text-primary">
+                              <CheckCircle2 size={13} />
+                              Pushed to Remote
+                            </span>
+                            <button
+                              onClick={() => handleRollbackPatch(patch.id)}
+                              className="flex items-center gap-1.5 rounded-lg border border-border-glass bg-bg-input px-2.5 py-1.5 text-xs text-text-muted hover:border-accent hover:text-accent"
+                              title="Revert local file change"
+                            >
+                              <RotateCcw size={12} />
+                              Revert Local
+                            </button>
+                          </>
+                        ) : isApplied ? (
+                          <>
+                            <button
+                              onClick={() => handlePushPatch(patch.id)}
+                              disabled={pushingPatchId === patch.id}
+                              className="flex items-center gap-1.5 rounded-lg bg-primary px-3.5 py-1.5 text-xs font-bold text-white shadow-sm hover:opacity-95 disabled:opacity-50"
+                              title="Commit and push this verified patch to remote GitHub repository"
+                            >
+                              {pushingPatchId === patch.id ? (
+                                <>
+                                  <RefreshCw size={13} className="animate-spin" />
+                                  Pushing to Remote...
+                                </>
+                              ) : (
+                                <>
+                                  <UploadCloud size={14} strokeWidth={2.5} />
+                                  Commit & Push to Remote
+                                </>
+                              )}
+                            </button>
+                            <button
+                              onClick={() => handleRollbackPatch(patch.id)}
+                              className="flex items-center gap-1.5 rounded-lg border border-border-glass bg-bg-input px-3 py-1.5 text-xs font-semibold text-text-secondary hover:border-accent hover:text-accent"
+                            >
+                              <RotateCcw size={13} />
+                              Rollback Fix
+                            </button>
+                          </>
                         ) : (
                           <button
                             onClick={() => handleApplyPatch(patch.id)}

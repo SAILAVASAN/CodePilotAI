@@ -1,5 +1,6 @@
 import os
 import shutil
+import subprocess
 import traceback
 import logging
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -17,7 +18,7 @@ if os.path.exists(env_path):
                 key, val = line.split("=", 1)
                 os.environ[key.strip()] = val.strip()
 
-from fastapi import FastAPI, BackgroundTasks, HTTPException, Query, Depends, Response
+from fastapi import FastAPI, BackgroundTasks, HTTPException, Query, Depends, Response, Body
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import Optional
@@ -652,6 +653,104 @@ def rollback_patch_endpoint(patch_id: int, current_user: dict = Depends(auth.get
 
     db.update_patch_status(patch_id, "proposed")
     return {"success": True, "message": "Patch rolled back."}
+
+@app.post("/api/patches/{patch_id}/push")
+def push_patch_endpoint(patch_id: int, payload: dict = Body(default={}), current_user: dict = Depends(auth.get_current_user)):
+    patch = db.get_patch(patch_id)
+    if not patch:
+        raise HTTPException(status_code=404, detail="Patch not found")
+
+    if patch["status"] not in ("applied", "pushed"):
+        raise HTTPException(status_code=400, detail="Patch must be applied locally before it can be pushed.")
+
+    session = db.get_debug_session(patch["session_id"])
+    if not session:
+        raise HTTPException(status_code=404, detail="Debug session not found")
+
+    repo = db.get_repository(session["repo_id"], current_user["id"])
+    if not repo:
+        raise HTTPException(status_code=404, detail="Repository not found")
+
+    local_path = repo.get("local_path")
+    if not local_path or not os.path.exists(local_path):
+        raise HTTPException(status_code=400, detail="Repository local directory does not exist on disk.")
+
+    git_bin = os.environ.get("GIT_PATH", "git")
+    startupinfo = None
+    if os.name == 'nt':
+        startupinfo = subprocess.STARTUPINFO()
+        startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+
+    # 1. Detect branch
+    try:
+        branch_res = subprocess.run(
+            [git_bin, "-C", local_path, "rev-parse", "--abbrev-ref", "HEAD"],
+            capture_output=True, text=True, check=True, startupinfo=startupinfo
+        )
+        current_branch = branch_res.stdout.strip() or "main"
+    except Exception as e:
+        logger.warning(f"Could not determine branch, defaulting to main: {e}")
+        current_branch = "main"
+
+    # 2. Stage patched file
+    file_path = patch["file_path"]
+    try:
+        subprocess.run(
+            [git_bin, "-C", local_path, "add", file_path],
+            capture_output=True, text=True, check=True, startupinfo=startupinfo
+        )
+    except subprocess.CalledProcessError as e:
+        raise HTTPException(status_code=400, detail=f"Git add failed: {e.stderr or e.stdout}")
+
+    # 3. Commit
+    custom_msg = payload.get("commit_message", "").strip()
+    root_cause = session.get("root_cause") or session.get("error_type") or "resolved bug"
+    commit_msg = custom_msg or f"fix(agent): apply verified patch for {file_path}\n\nSession #{session['id']}: {root_cause[:120]}"
+
+    commit_res = subprocess.run(
+        [git_bin, "-C", local_path, "commit", "-m", commit_msg],
+        capture_output=True, text=True, startupinfo=startupinfo
+    )
+    if commit_res.returncode != 0 and "nothing to commit" not in commit_res.stdout and "nothing to commit" not in commit_res.stderr:
+        logger.warning(f"Commit note: {commit_res.stderr or commit_res.stdout}")
+
+    # 4. Check for OAuth token to form authenticated push URL if needed
+    push_remote = "origin"
+    for prov in ("github", "gitlab"):
+        try:
+            auth_url = oauth.build_authenticated_clone_url(current_user["id"], prov, repo.get("url", ""))
+            if auth_url:
+                push_remote = auth_url
+                break
+        except Exception:
+            pass
+
+    # 5. Push to remote
+    try:
+        push_res = subprocess.run(
+            [git_bin, "-C", local_path, "push", push_remote, current_branch],
+            capture_output=True, text=True, check=True, startupinfo=startupinfo
+        )
+    except subprocess.CalledProcessError as e:
+        err_msg = e.stderr or e.stdout
+        logger.error(f"Git push failed: {err_msg}")
+        raise HTTPException(status_code=400, detail=f"Git push failed: {err_msg}")
+
+    # 6. Retrieve commit SHA
+    hash_res = subprocess.run(
+        [git_bin, "-C", local_path, "rev-parse", "--short", "HEAD"],
+        capture_output=True, text=True, startupinfo=startupinfo
+    )
+    commit_hash = hash_res.stdout.strip() if hash_res.returncode == 0 else ""
+
+    db.update_patch_status(patch_id, "pushed")
+
+    return {
+        "success": True,
+        "commit_hash": commit_hash,
+        "branch": current_branch,
+        "message": f"Successfully pushed commit {commit_hash} to {current_branch}!"
+    }
 
 @app.post("/api/auth/signup")
 def auth_signup(payload: dict, response: Response):

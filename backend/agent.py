@@ -301,6 +301,8 @@ class SoftwareAgent:
                             SoftwareAgent._working_gemini_model = model
                             break
                         else:
+                            if SoftwareAgent._working_gemini_model == model:
+                                SoftwareAgent._working_gemini_model = None
                             last_err = f"Gemini API ({model}) returned {response.status_code}: {response.text}"
                             logger.warning(last_err)
                     except Exception as e:

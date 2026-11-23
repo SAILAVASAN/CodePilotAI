@@ -147,6 +147,9 @@ class LLMClient:
                         if parts:
                             LLMClient._working_gemini_model = model
                             return parts[0].get("text", "")
+                else:
+                    if LLMClient._working_gemini_model == model:
+                        LLMClient._working_gemini_model = None
                 logger.warning(f"Gemini {model} returned status {resp.status_code}: {resp.text}")
             except Exception as e:
                 logger.warning(f"Error calling Gemini {model}: {e}")

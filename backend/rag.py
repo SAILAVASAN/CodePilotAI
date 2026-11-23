@@ -115,15 +115,61 @@ class GeminiClient:
                 last_error = response.text
                 if response.status_code == 429 or response.status_code >= 500:
                     if attempt < retries:
-                        time.sleep(min(2 ** attempt, 20))
+                        sleep_time = min(3 * (attempt + 1) + 1, 25)
+                        logger.warning(f"Embedding returned {response.status_code}, retrying in {sleep_time}s (attempt {attempt+1}/{retries})...")
+                        time.sleep(sleep_time)
                         continue
                 break  # non-retryable (e.g. 400 bad request) — no point retrying
             except Exception as e:
                 last_error = str(e)
                 if attempt < retries:
-                    time.sleep(min(2 ** attempt, 20))
+                    sleep_time = min(3 * (attempt + 1) + 1, 25)
+                    time.sleep(sleep_time)
 
         raise Exception(f"Embedding with model {model} failed after {attempt + 1} attempt(s): {last_error}")
+
+    def embed_texts_batch(self, texts: list[str], model: str = EMBEDDING_MODELS[0], retries: int = 4) -> list[list[float]]:
+        """Batch embed multiple texts using Google Gemini's batchEmbedContents endpoint.
+        This reduces N individual requests down to 1 request, drastically avoiding 429 rate limits."""
+        if not texts:
+            return []
+
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:batchEmbedContents?key={self.api_key}"
+        requests_payload = [
+            {"model": f"models/{model}", "content": {"parts": [{"text": t}]}}
+            for t in texts
+        ]
+
+        last_error = None
+        for attempt in range(retries + 1):
+            try:
+                response = self.client.post(
+                    url,
+                    json={"requests": requests_payload},
+                    headers={"Content-Type": "application/json"}
+                )
+                if response.status_code == 200:
+                    data = response.json()
+                    return [item["values"] for item in data.get("embeddings", [])]
+                last_error = response.text
+                if response.status_code == 429 or response.status_code >= 500:
+                    sleep_time = min(3 * (attempt + 1) + 2, 30)
+                    logger.warning(f"Batch embedding returned {response.status_code}, backing off for {sleep_time}s (attempt {attempt+1}/{retries})")
+                    time.sleep(sleep_time)
+                    continue
+                break
+            except Exception as e:
+                last_error = str(e)
+                sleep_time = min(3 * (attempt + 1) + 2, 30)
+                if attempt < retries:
+                    time.sleep(sleep_time)
+
+        logger.warning(f"batchEmbedContents failed ({last_error}), falling back to sequential embed_text...")
+        results = []
+        for t in texts:
+            results.append(self.embed_text(t, model=model))
+            time.sleep(0.2)
+        return results
 
 def clone_repository(repo_url: str, dest_dir: str, git_path: str = "git") -> str:
     """Clones a git repository using the specified git binary to dest_dir."""

@@ -157,25 +157,25 @@ def ingest_repository_task(repo_id: int, api_key: str, clone_url_override: Optio
         embedded_chunks = []
         total = len(all_chunks)
         if total > 0:
-            # Resolve which embedding model this key can use ONCE, synchronously,
-            # before firing off concurrent requests — probing per chunk from
-            # multiple worker threads at once races on which model "won".
             embedding_model = rag_client.resolve_working_model()
             logger.info(f"Using embedding model '{embedding_model}' for repository {repo_id}")
 
-            def embed_chunk(chunk):
-                return {**chunk, "embedding": rag_client.embed_text(chunk["text"], model=embedding_model)}
+            # Batch embed in slices of up to 30 chunks per single API request to avoid 429 rate limit errors
+            batch_size = 30
+            for i in range(0, total, batch_size):
+                chunk_batch = all_chunks[i:i + batch_size]
+                texts = [c["text"] for c in chunk_batch]
+                try:
+                    vectors = rag_client.embed_texts_batch(texts, model=embedding_model)
+                    for c, v in zip(chunk_batch, vectors):
+                        embedded_chunks.append({**c, "embedding": v})
+                except Exception as chunk_err:
+                    logger.error(f"Error embedding batch {i}-{i+len(chunk_batch)}: {chunk_err}")
 
-            with ThreadPoolExecutor(max_workers=EMBEDDING_CONCURRENCY) as executor:
-                futures = {executor.submit(embed_chunk, chunk): chunk for chunk in all_chunks}
-                for done, future in enumerate(as_completed(futures), start=1):
-                    chunk = futures[future]
-                    try:
-                        embedded_chunks.append(future.result())
-                    except Exception as chunk_err:
-                        logger.error(f"Error embedding chunk of {chunk['file_path']}: {chunk_err}")
-                    if done % 25 == 0 or done == total:
-                        logger.info(f"Embedded {done}/{total} chunks for repository {repo_id}")
+                done = min(i + len(chunk_batch), total)
+                logger.info(f"Embedded {done}/{total} chunks for repository {repo_id}")
+                if done < total:
+                    time.sleep(0.5)  # Gentle spacing between batches to prevent RPM bursts
 
         if total > 0 and not embedded_chunks:
             raise Exception(f"All {total} chunks failed to embed — check your API key and quota.")
